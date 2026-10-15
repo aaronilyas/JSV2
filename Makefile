@@ -13,4 +13,4 @@ wasm:
 
 test: wasm
 	cd runtime/go && go test ./...
-	node --experimental-strip-types --test tests/*.ts tests/parser/*.ts tests/checker/*.ts tests/runtime/*.ts
+	node --experimental-strip-types --test tests/*.ts tests/parser/*.ts tests/checker/*.ts tests/runtime/*.ts tests/mcp/*.ts

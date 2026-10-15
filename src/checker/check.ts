@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { Diagnostic } from "../diagnostics.ts";
+import type { Diagnostic, SourcePosition } from "../diagnostics.ts";
 import { parse } from "../parser/parse.ts";
 import type {
   Block,
@@ -47,6 +47,11 @@ import {
 
 export type CheckOptions = {
   readFile?: (absolutePath: string) => string | null;
+  typeQuery?: {
+    line: number;
+    column: number;
+    hits: { span: Span; type: Type }[];
+  };
 };
 
 type BindingKind = "value" | "type" | "both";
@@ -86,6 +91,11 @@ type CheckerContext = {
   returnType: Type | null;
   thisType: Type | null;
   inExprStmt: boolean;
+  typeQuery?: {
+    line: number;
+    column: number;
+    hits: { span: Span; type: Type }[];
+  };
 };
 
 function defaultReadFile(absolutePath: string): string | null {
@@ -231,6 +241,18 @@ function resolveTypeNode(
   ctx: CheckerContext,
   node: TypeNode,
   typeParamNames: Set<string> = new Set(),
+): Type {
+  const type = resolveTypeNodeBody(ctx, node, typeParamNames);
+  if (ctx.typeQuery !== undefined) {
+    ctx.typeQuery.hits.push({ span: node.span, type });
+  }
+  return type;
+}
+
+function resolveTypeNodeBody(
+  ctx: CheckerContext,
+  node: TypeNode,
+  typeParamNames: Set<string>,
 ): Type {
   switch (node.kind) {
     case "prim":
@@ -386,6 +408,7 @@ function checkModule(
   readFile: (absolutePath: string) => string | null,
   moduleCache: Map<string, ModuleResult>,
   checkingStack: Set<string>,
+  typeQuery?: CheckOptions["typeQuery"],
 ): ModuleResult {
   const cached = moduleCache.get(absolutePath);
   if (cached !== undefined) return cached;
@@ -426,6 +449,7 @@ function checkModule(
     returnType: null,
     thisType: null,
     inExprStmt: false,
+    typeQuery,
   };
 
   // Imports first so imported types are in scope for hoisted signatures.
@@ -1313,6 +1337,18 @@ function checkExpr(
   expr: Expr,
   expected: Type | null,
 ): Type {
+  const type = checkExprBody(ctx, expr, expected);
+  if (ctx.typeQuery !== undefined) {
+    ctx.typeQuery.hits.push({ span: expr.span, type });
+  }
+  return type;
+}
+
+function checkExprBody(
+  ctx: CheckerContext,
+  expr: Expr,
+  expected: Type | null,
+): Type {
   switch (expr.kind) {
     case "number":
       return prim("number");
@@ -2118,7 +2154,14 @@ export function checkSource(
   const absolute = resolve(file);
   const moduleCache = new Map<string, ModuleResult>();
   const checkingStack = new Set<string>();
-  checkModule(absolute, source, readFile, moduleCache, checkingStack);
+  checkModule(
+    absolute,
+    source,
+    readFile,
+    moduleCache,
+    checkingStack,
+    options?.typeQuery,
+  );
   return { diagnostics: gatherDiagnostics(moduleCache, absolute) };
 }
 
@@ -2141,5 +2184,92 @@ export function checkFile(
       ],
     };
   }
-  return checkSource(source, absolute, { readFile });
+  return checkSource(source, absolute, { ...options, readFile });
+}
+
+export type TypeHit = {
+  type: string;
+  start: SourcePosition;
+  end: SourcePosition;
+};
+
+function containsPosition(
+  span: Span,
+  line: number,
+  column: number,
+): boolean {
+  const afterStart =
+    line > span.start.line ||
+    (line === span.start.line && column >= span.start.column);
+  const beforeEnd =
+    line < span.end.line ||
+    (line === span.end.line && column <= span.end.column);
+  return afterStart && beforeEnd;
+}
+
+/** UTF-16 code-unit offset of a 1-based line/column position. */
+function positionOffset(source: string, pos: SourcePosition): number {
+  let line = 1;
+  let column = 1;
+  for (let i = 0; i < source.length; i++) {
+    if (line === pos.line && column === pos.column) return i;
+    if (source.charCodeAt(i) === 10) {
+      line += 1;
+      column = 1;
+    } else {
+      column += 1;
+    }
+  }
+  if (line === pos.line && column === pos.column) return source.length;
+  return source.length;
+}
+
+function spanExtent(source: string, span: Span): number {
+  return positionOffset(source, span.end) - positionOffset(source, span.start);
+}
+
+export function typeAt(
+  source: string,
+  file: string,
+  line: number,
+  column: number,
+  options?: CheckOptions,
+): { hit: TypeHit | null; diagnostics: Diagnostic[] } {
+  const hits: { span: Span; type: Type }[] = [];
+  const typeQuery = { line, column, hits };
+  const { diagnostics } = checkSource(source, file, {
+    ...options,
+    typeQuery,
+  });
+
+  const containing = hits.filter((h) => containsPosition(h.span, line, column));
+  if (containing.length === 0) {
+    return { hit: null, diagnostics };
+  }
+
+  const hasNonError = containing.some((h) => h.type.kind !== "error");
+  const candidates = hasNonError
+    ? containing.filter((h) => h.type.kind !== "error")
+    : containing;
+
+  // Prefer smallest extent; on a tie prefer the earlier hit (inner node).
+  let best = candidates[0]!;
+  let bestExtent = spanExtent(source, best.span);
+  for (let i = 1; i < candidates.length; i++) {
+    const h = candidates[i]!;
+    const extent = spanExtent(source, h.span);
+    if (extent < bestExtent) {
+      best = h;
+      bestExtent = extent;
+    }
+  }
+
+  return {
+    hit: {
+      type: typeToString(best.type),
+      start: best.span.start,
+      end: best.span.end,
+    },
+    diagnostics,
+  };
 }

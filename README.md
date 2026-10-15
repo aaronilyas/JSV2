@@ -1,6 +1,6 @@
 # JSV2
 
-JSV2 is a constrained TypeScript-like language aimed at agentic coding. It includes a fine-grained DOM/reactivity runtime so React is not used for ordinary UI, plus a hand-written lexer/parser, type checker, TypeScript build/check tooling, and a CLI (`jsv`). The signal graph, keyed list diff, and XML escape run in a Go/WASM module loaded once by JS. An MCP server is planned but not implemented yet.
+JSV2 is a constrained TypeScript-like language aimed at agentic coding. It includes a fine-grained DOM/reactivity runtime so React is not used for ordinary UI, plus a hand-written lexer/parser, type checker, TypeScript build/check tooling, a CLI (`jsv`), and a stdio MCP server for language intelligence. The signal graph, keyed list diff, and XML escape run in a Go/WASM module loaded once by JS.
 
 ## Requirements
 
@@ -19,7 +19,7 @@ npm install
 |--------|----------------|
 | `make check` | `tsc --noEmit` (strict typecheck) |
 | `make wasm` | Build `runtime/wasm/jsv.wasm` and copy `wasm_exec.js` |
-| `make test` | `make wasm`, Go unit tests, then `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, `tests/checker/*.ts`, and `tests/runtime/*.ts` |
+| `make test` | `make wasm`, Go unit tests, then `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, `tests/checker/*.ts`, `tests/runtime/*.ts`, and `tests/mcp/*.ts` |
 | `make build` | Compile TypeScript to `dist/` with `tsc` |
 
 `make build` assumes dependencies are already installed. `make test` builds the WASM module first.
@@ -51,3 +51,13 @@ Diagnostics always go to stdout. See [docs/syntax.md](docs/syntax.md) for the la
 ## DOM
 
 React is not used. Components are functions that return nodes; updates are per text/attribute/keyed list. Import from `jsv/dom` in `.jsv` sources. See [docs/dom.md](docs/dom.md).
+
+## MCP
+
+Stdio MCP server for agents (not a full LSP):
+
+```bash
+node --experimental-strip-types src/mcp/server.ts
+```
+
+Tools: `check`, `typeOf`, `suggestFix`, `domAnalyze`. Stdout is MCP-only. DOM analysis does not load WASM. See [docs/mcp.md](docs/mcp.md).
