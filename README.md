@@ -54,6 +54,17 @@ Examples: [examples/hello.jsv](examples/hello.jsv) (backend `renderToString`) an
 
 React is not used. Components are functions that return nodes; updates are per text/attribute/keyed list. Import from `jsv/dom` in `.jsv` sources. See [docs/dom.md](docs/dom.md).
 
+## Runtime loading
+
+Node (backend and tests) and the browser share one WASM instance per process or page. Node reads `runtime/wasm/jsv.wasm` from disk. A browser fetches that file and Go's `wasm_exec.js`, then calls `WebAssembly.instantiateStreaming` (the response needs `Content-Type: application/wasm`). To serve the files from other URLs, set this before importing the runtime:
+
+```js
+globalThis.__jsvWasmAssets = {
+  wasmURL: "/jsv.wasm",
+  execURL: "/wasm_exec.js",
+};
+```
+
 ## MCP
 
 Stdio MCP server for agents (not a full LSP):

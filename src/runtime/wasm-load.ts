@@ -1,7 +1,13 @@
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import vm from "node:vm";
+export type NodeStats = {
+  live: number;
+  capacity: number;
+  free: number;
+};
+
+export type PendingResult = {
+  threw: boolean;
+  error: unknown;
+};
 
 export type JsvRuntime = {
   backend(): string;
@@ -12,6 +18,9 @@ export type JsvRuntime = {
   computedGet(id: number): unknown;
   effectNew(fn: () => unknown): number;
   effectDispose(id: number): void;
+  releaseNode(id: number): void;
+  nodeStats(): NodeStats;
+  takePending(): PendingResult;
   reconcile(
     prev: string[],
     next: string[],
@@ -19,26 +28,10 @@ export type JsvRuntime = {
   escapeXml(s: string): string;
 };
 
-type GoConstructor = new () => {
-  importObject: WebAssembly.Imports;
-  run(instance: WebAssembly.Instance): Promise<void>;
-};
-
-function findWasmDir(): string {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  let dir = here;
-  for (let i = 0; i < 5; i++) {
-    const wasmPath = path.join(dir, "runtime", "wasm", "jsv.wasm");
-    if (fs.existsSync(wasmPath)) {
-      return path.join(dir, "runtime", "wasm");
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  throw new Error(
-    `jsv.wasm not found (searched up from ${here} for runtime/wasm/jsv.wasm); run make wasm`,
-  );
+function isNodeRuntime(): boolean {
+  const proc = (globalThis as { process?: { versions?: { node?: string } } })
+    .process;
+  return typeof proc?.versions?.node === "string";
 }
 
 let loadPromise: Promise<void> | null = null;
@@ -51,35 +44,28 @@ function getRuntime(): JsvRuntime {
   return rt;
 }
 
+/**
+ * Load the single WASM instance for this process (Node) or page (browser).
+ * Node reads the module from disk. Browsers fetch it. A second call reuses
+ * the in-flight or finished load and does not instantiate again.
+ */
 export function ensureWasm(): Promise<void> {
   if (loadPromise !== null) return loadPromise;
-  loadPromise = (async () => {
-    const wasmDir = findWasmDir();
-    const execSource = fs.readFileSync(
-      path.join(wasmDir, "wasm_exec.js"),
-      "utf8",
-    );
-    vm.runInThisContext(execSource, { filename: "wasm_exec.js" });
-
-    const Go = (globalThis as { Go?: GoConstructor }).Go;
-    if (Go === undefined) {
-      throw new Error("globalThis.Go was not set by wasm_exec.js");
-    }
-
-    const ready = new Promise<void>((resolve) => {
-      (globalThis as { __jsvWasmReady?: () => void }).__jsvWasmReady = () => {
-        resolve();
-      };
-    });
-
-    const go = new Go();
-    const wasmBytes = fs.readFileSync(path.join(wasmDir, "jsv.wasm"));
-    const result = await WebAssembly.instantiate(wasmBytes, go.importObject);
-    // Do not await: go.run resolves only when the Go program exits.
-    void go.run(result.instance);
-    await ready;
-  })();
+  loadPromise = loadRuntime().catch((err: unknown) => {
+    loadPromise = null;
+    throw err;
+  });
   return loadPromise;
+}
+
+async function loadRuntime(): Promise<void> {
+  if (isNodeRuntime()) {
+    const { loadNodeWasm } = await import("./wasm-load-node.ts");
+    await loadNodeWasm();
+    return;
+  }
+  const { loadBrowserWasm } = await import("./wasm-browser.ts");
+  await loadBrowserWasm();
 }
 
 export function jsvRuntime(): JsvRuntime {
@@ -88,4 +74,16 @@ export function jsvRuntime(): JsvRuntime {
 
 export function runtimeBackend(): "wasm" {
   return getRuntime().backend() as "wasm";
+}
+
+export function nodeStats(): NodeStats {
+  return getRuntime().nodeStats();
+}
+
+/** Rethrow a user callback error captured by the WASM graph, if any. */
+export function throwIfPending(): void {
+  const pending = getRuntime().takePending();
+  if (pending.threw) {
+    throw pending.error;
+  }
 }

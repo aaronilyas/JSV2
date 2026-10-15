@@ -47,3 +47,14 @@ renderToString(node: Node): string
 - `list` reconciles by key: same key keeps the DOM node and `set`s the row item signal; new keys mount; missing keys unmount; order follows the array via `insertBefore`.
 
 The signal graph, keyed list diff, and XML escape run in a Go WASM module (`runtime/go/` → `runtime/wasm/jsv.wasm`), loaded once by JS. DOM node creation, event listeners, and `insertBefore` stay in JS; `mount` applies patches in JS.
+
+Effects that subscribe to the same signal run in subscription order. A thrown effect or computed callback is rethrown to the caller; the graph keeps accepting later updates. `effect`'s dispose function releases that effect's node. Signal and computed objects are tracked with `FinalizationRegistry`, so a node that the page no longer holds and that no effect still reads can be freed.
+
+### Browser and Node
+
+`src/runtime/wasm-load.ts` picks one loader:
+
+- Node uses `src/runtime/wasm-load-node.ts` (filesystem). This is the backend and test path.
+- Otherwise `src/runtime/wasm-browser.ts` fetches `wasm_exec.js` and the `.wasm` module (`fetch` + `WebAssembly.instantiateStreaming`). It does not use Node built-ins.
+
+Both paths keep a single instance and do not spawn a Go process. If the files are not served next to the module URL `../../runtime/wasm/`, set `globalThis.__jsvWasmAssets` to `{ wasmURL, execURL }` before the first import. The wasm response should use `Content-Type: application/wasm`; any other type falls back to `WebAssembly.instantiate`.
