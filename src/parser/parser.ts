@@ -660,6 +660,16 @@ function parseUnary(p: Parser): Expr {
       span: { start: opTok.span.start, end: argument.span.end },
     };
   }
+  if (atKeyword(p, "typeof")) {
+    const opTok = advance(p);
+    const argument = parseUnary(p);
+    return {
+      kind: "unary",
+      op: "typeof",
+      argument,
+      span: { start: opTok.span.start, end: argument.span.end },
+    };
+  }
   return parsePostfix(p);
 }
 

@@ -7,4 +7,4 @@ check:
 	npx tsc --noEmit
 
 test:
-	node --experimental-strip-types --test tests/*.ts tests/parser/*.ts
+	node --experimental-strip-types --test tests/*.ts tests/parser/*.ts tests/checker/*.ts

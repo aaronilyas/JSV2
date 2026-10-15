@@ -8,7 +8,7 @@ Spans are 1-based and inclusive. Newlines are `\n` only; `\r` is whitespace.
 - Whitespace, `//` line comments, and non-nested `/* */` block comments are skipped.
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*`
 - Reserved keywords (never identifiers):  
-  `import export from default function let const type interface class if else while for return true false null undefined string number boolean void never unknown constructor as new`
+  `import export from default function let const type interface class if else while for return true false null undefined string number boolean void never unknown constructor as new typeof`
 - Numbers: `0` or `[1-9][0-9]*`, optional fraction and exponent. Leading-dot forms and leading-zero forms like `01` are invalid.
 - Strings: `'` / `"` with escapes `\\ \' \" \n \r \t` and `\u` + 4 hex digits.
 - Templates: backticks with `${` expr `}`; escapes as above plus `` \` `` and `\$`. Nested templates inside `${}` are allowed.
@@ -81,7 +81,7 @@ Primary forms:
 6. `< > <= >=`
 7. `+ -`
 8. `* / %`
-9. Prefix unary `!` `-`
+9. Prefix unary `!` `-` `typeof`
 10. Postfix: call, `.` Ident, `[` Expr `]`, `as` Type  
     (`as` binds tighter than unary: `!x as T` is `!(x as T)`)
 11. Primary: literals, ident, `( Expr )`, array/object literals, parenthesized arrow, `new`

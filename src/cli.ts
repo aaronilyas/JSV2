@@ -2,12 +2,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { checkFile } from "./checker/check.ts";
 import {
   type Diagnostic,
   diagnosticsResult,
   formatDiagnosticsText,
 } from "./diagnostics.ts";
-import { parse } from "./parser/parse.ts";
 
 const packageDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -22,7 +22,7 @@ const USAGE = `Usage: jsv <command> [options]
 Commands:
   version              Print the jsv2 package version
   help                 Show this help
-  check <file.jsv>     Parse a JSV2 source file
+  check <file.jsv>     Parse and typecheck a JSV2 source file
   run <file.jsv>       Run a JSV2 source file
 
 Options:
@@ -123,8 +123,7 @@ function handleFileCommand(
     return 2;
   }
 
-  const source = readFileSync(filePath, "utf8");
-  const { diagnostics } = parse(source, filePath);
+  const { diagnostics } = checkFile(filePath);
   emitDiagnostics(diagnostics, format);
   return diagnostics.length > 0 ? 1 : 0;
 }

@@ -8,7 +8,7 @@ Use these exact targets (do not invent alternatives):
 
 - `make build` — compile `src/` to `dist/` with `tsc` (deps must already be installed)
 - `make check` — `tsc --noEmit`
-- `make test` — `node --experimental-strip-types --test tests/*.ts tests/parser/*.ts`
+- `make test` — `node --experimental-strip-types --test tests/*.ts tests/parser/*.ts tests/checker/*.ts`
 
 ## CLI
 
@@ -30,11 +30,11 @@ Use these exact targets (do not invent alternatives):
 - Semicolons are required (no ASI)
 - Spans are 1-based inclusive (`SourcePosition` line/column; column counts UTF-16 code units)
 - Primitive type names (`string`, `number`, `boolean`, `null`, `void`, `never`, `unknown`, `undefined`) are reserved keywords
-- `jsv check` is parse-only until the type checker exists
+- Checker: `checkSource` / `checkFile` from `src/checker/check.ts`
+- `jsv check` parses then typechecks; parse errors skip the checker (no type diagnostics)
 
 ## Later slices (do not implement here)
 
-- Checker: `src/checker/`
 - DOM/reactivity: `src/runtime/`
 - Go WASM: `runtime/go/` emitting `runtime/wasm/jsv.wasm`, loaded by JS (never spawn a Go process per call)
 - MCP: `src/mcp/`

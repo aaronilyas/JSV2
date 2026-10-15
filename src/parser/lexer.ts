@@ -80,6 +80,7 @@ export const KEYWORDS = new Set([
   "constructor",
   "as",
   "new",
+  "typeof",
 ]);
 
 type BraceFrame = "block" | "template";

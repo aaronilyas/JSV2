@@ -248,7 +248,7 @@ export type Expr =
     }
   | {
       kind: "unary";
-      op: "!" | "-";
+      op: "!" | "-" | "typeof";
       argument: Expr;
       span: Span;
     }
