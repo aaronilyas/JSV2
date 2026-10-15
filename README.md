@@ -19,7 +19,7 @@ npm install
 |--------|----------------|
 | `make check` | `tsc --noEmit` (strict typecheck) |
 | `make wasm` | Build `runtime/wasm/jsv.wasm` and copy `wasm_exec.js` |
-| `make test` | `make wasm`, Go unit tests, then `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, `tests/checker/*.ts`, `tests/runtime/*.ts`, and `tests/mcp/*.ts` |
+| `make test` | `make wasm`, Go unit tests, then `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, `tests/checker/*.ts`, `tests/runtime/*.ts`, `tests/mcp/*.ts`, and `tests/examples/*.ts` |
 | `make build` | Compile TypeScript to `dist/` with `tsc` |
 
 `make build` assumes dependencies are already installed. `make test` builds the WASM module first.
@@ -39,14 +39,16 @@ After `make build`, the `bin/jsv` shim loads `dist/cli.js`.
 | `jsv version` / `--version` / `-v` | Print package version |
 | `jsv help` / `--help` / `-h` | Print usage |
 | `jsv check <file.jsv>` | Parse then typecheck; exit 0 on success, exit 1 on diagnostics. Typechecking is skipped when the parse fails |
-| `jsv run <file.jsv>` | Validate path/extension; then report `jsv.not_implemented` (exit 2) |
+| `jsv run <file.jsv>` | Typecheck, transpile to ESM, and execute in-process; exit 0 on success, exit 1 on diagnostics or runtime errors |
 
 Options:
 
 - `--format text` (default) — one human-readable diagnostic line per issue (includes the code); success prints nothing
 - `--format json` — single JSON object `{ "ok": boolean, "diagnostics": Diagnostic[] }` on stdout
 
-Diagnostics always go to stdout. See [docs/syntax.md](docs/syntax.md) for the language subset and [docs/types.md](docs/types.md) for typechecker rules.
+Diagnostics always go to stdout. See [docs/syntax.md](docs/syntax.md) for the language subset, [docs/types.md](docs/types.md) for typechecker rules, and [docs/run.md](docs/run.md) for `jsv run`.
+
+Examples: [examples/hello.jsv](examples/hello.jsv) (backend `renderToString`) and [examples/counter.jsv](examples/counter.jsv) (exported component for a host `mount`).
 
 ## DOM
 

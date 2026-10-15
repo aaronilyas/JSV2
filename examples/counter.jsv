@@ -1,0 +1,9 @@
+import { signal, computed, h, text, Node } from "jsv/dom";
+
+export function Counter(): Node {
+  let n = signal<number>(0);
+  let label = computed<string>(() => {
+    return "count " + n.get();
+  });
+  return h("button", { onClick: () => { n.update((v: number) => { return v + 1; }); } }, [text(label)]);
+}

@@ -115,15 +115,28 @@ test("check --format json success is ok with empty diagnostics", () => {
   }
 });
 
-test("run of existing .jsv yields jsv.not_implemented with exit 2", () => {
+test("run of valid .jsv exits 0", () => {
   const dir = mkdtempSync(join(tmpdir(), "jsv2-"));
   try {
     const file = join(dir, "sample.jsv");
-    writeFileSync(file, "// placeholder\n");
+    writeFileSync(file, 'console.log("ok");\n');
     const result = runCli(["run", file]);
-    assert.equal(result.status, 2);
-    assert.match(result.stdout, /jsv\.not_implemented/);
-    assert.match(result.stdout, /run/);
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout.trim(), "ok");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("run of type error exits 1 with jsv.check.not_assignable and does not execute", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jsv2-"));
+  try {
+    const file = join(dir, "bad.jsv");
+    writeFileSync(file, 'let x: string = 1;\nconsole.log("ran");\n');
+    const result = runCli(["run", file]);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /jsv\.check\.not_assignable/);
+    assert.doesNotMatch(result.stdout, /ran/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

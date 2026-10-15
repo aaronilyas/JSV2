@@ -1,0 +1,11 @@
+import { signal, h, text, renderToString, Node } from "jsv/dom";
+
+let name = signal<string>("Ada");
+
+function view(): Node {
+  return h("p", {}, [text(name)]);
+}
+
+console.log(renderToString(view()));
+name.set("Bea");
+console.log(renderToString(view()));

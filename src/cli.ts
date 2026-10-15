@@ -8,6 +8,7 @@ import {
   diagnosticsResult,
   formatDiagnosticsText,
 } from "./diagnostics.ts";
+import { runFile } from "./transpile/run.ts";
 
 const packageDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -67,7 +68,7 @@ function handleFileCommand(
   command: "check" | "run",
   filePath: string | undefined,
   format: string,
-): number {
+): number | Promise<number> {
   if (filePath === undefined || filePath.length === 0) {
     emitDiagnostics(
       [
@@ -110,17 +111,7 @@ function handleFileCommand(
   }
 
   if (command === "run") {
-    emitDiagnostics(
-      [
-        errorDiagnostic(
-          "jsv.not_implemented",
-          "run is not implemented yet",
-          filePath,
-        ),
-      ],
-      format,
-    );
-    return 2;
+    return runFile(filePath, format === "json" ? "json" : "text");
   }
 
   const { diagnostics } = checkFile(filePath);
@@ -128,7 +119,7 @@ function handleFileCommand(
   return diagnostics.length > 0 ? 1 : 0;
 }
 
-export function main(argv: readonly string[]): number {
+export function main(argv: readonly string[]): number | Promise<number> {
   const { values, positionals } = parseArgs({
     args: [...argv],
     options: {
@@ -180,10 +171,21 @@ export function main(argv: readonly string[]): number {
   return 1;
 }
 
+async function exitWithMain(argv: readonly string[]): Promise<void> {
+  try {
+    const code = await main(argv);
+    process.exit(code);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`${message}\n`);
+    process.exit(1);
+  }
+}
+
 const entry = process.argv[1];
 if (
   entry !== undefined &&
   fileURLToPath(import.meta.url) === resolve(entry)
 ) {
-  process.exit(main(process.argv.slice(2)));
+  void exitWithMain(process.argv.slice(2));
 }
