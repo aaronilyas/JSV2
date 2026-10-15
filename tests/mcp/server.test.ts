@@ -122,6 +122,20 @@ effect(() => {
     assert.ok(
       dom.issues.some((i) => i.code === "jsv.dom.effect_self_write"),
     );
+
+    const missingDom = parseToolJson(
+      await client.callTool({
+        name: "domAnalyze",
+        arguments: {},
+      }),
+    ) as {
+      issues: unknown[];
+      diagnostics: { code: string; message: string }[];
+    };
+    assert.deepEqual(missingDom.issues, []);
+    assert.equal(missingDom.diagnostics.length, 1);
+    assert.equal(missingDom.diagnostics[0]!.code, "jsv.mcp.missing_input");
+    assert.equal(missingDom.diagnostics[0]!.message, "Provide source or path.");
   } finally {
     await client.close();
   }

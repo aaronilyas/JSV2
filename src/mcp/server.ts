@@ -194,12 +194,13 @@ export function createServer(): McpServer {
     (args) => {
       const resolved = resolveSourceInput(args);
       if (!resolved.ok) {
+        // `issues` is DOM-only. Input failures belong in `diagnostics`.
         return textResult({
           signals: [],
           effects: [],
           lists: [],
-          issues: [resolved.diagnostic],
-          diagnostics: [],
+          issues: [],
+          diagnostics: [resolved.diagnostic],
         });
       }
       return textResult(domAnalyze(resolved.source, resolved.file));
