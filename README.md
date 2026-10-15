@@ -1,8 +1,6 @@
 # JSV2
 
-JSV2 is a constrained TypeScript-like language aimed at agentic coding. The long-term plan includes a DOM/reactivity model so React is unnecessary, a hot runtime in Go/WASM, and language intelligence via an MCP server. Those pieces are not implemented yet.
-
-This repository currently provides the project skeleton, a hand-written lexer/parser and type checker for the JSV2 subset, TypeScript build/check tooling, and a CLI (`jsv`). The runtime and MCP server are not implemented yet.
+JSV2 is a constrained TypeScript-like language aimed at agentic coding. It includes a fine-grained DOM/reactivity runtime so React is not used for ordinary UI, plus a hand-written lexer/parser, type checker, TypeScript build/check tooling, and a CLI (`jsv`). A hot Go/WASM port of the graph and keyed diff, and an MCP server, are planned but not implemented yet.
 
 ## Requirements
 
@@ -19,7 +17,7 @@ npm install
 | Target | What it does |
 |--------|----------------|
 | `make check` | `tsc --noEmit` (strict typecheck) |
-| `make test` | `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, and `tests/checker/*.ts` |
+| `make test` | `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, `tests/checker/*.ts`, and `tests/runtime/*.ts` |
 | `make build` | Compile TypeScript to `dist/` with `tsc` |
 
 `make build` assumes dependencies are already installed.
@@ -46,4 +44,8 @@ Options:
 - `--format text` (default) — one human-readable diagnostic line per issue (includes the code); success prints nothing
 - `--format json` — single JSON object `{ "ok": boolean, "diagnostics": Diagnostic[] }` on stdout
 
-Diagnostics always go to stdout. See [docs/syntax.md](docs/syntax.md) for the language subset and [docs/types.md](docs/types.md) for typechecker rules. DOM runtime, WASM, and MCP are not implemented yet.
+Diagnostics always go to stdout. See [docs/syntax.md](docs/syntax.md) for the language subset and [docs/types.md](docs/types.md) for typechecker rules.
+
+## DOM
+
+React is not used. Components are functions that return nodes; updates are per text/attribute/keyed list. Import from `jsv/dom` in `.jsv` sources. See [docs/dom.md](docs/dom.md).

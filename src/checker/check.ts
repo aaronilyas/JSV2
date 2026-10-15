@@ -16,6 +16,7 @@ import type {
   TypeNode,
   VarStmt,
 } from "../parser/ast.ts";
+import { createDomLibModule } from "./dom-lib.ts";
 import {
   ERROR_TYPE,
   arrayType,
@@ -427,9 +428,15 @@ function checkModule(
     inExprStmt: false,
   };
 
+  // Imports first so imported types are in scope for hoisted signatures.
+  for (const stmt of program.body) {
+    if (stmt.kind === "import") checkImport(ctx, stmt);
+  }
+
   hoistDeclarations(ctx, program);
 
   for (const stmt of program.body) {
+    if (stmt.kind === "import") continue;
     checkStatement(ctx, stmt);
   }
 
@@ -668,6 +675,13 @@ function resolveAndLoadModule(
   specifier: string,
   span: Span,
 ): ModuleResult | null {
+  if (specifier === "jsv/dom") {
+    const cached = ctx.moduleCache.get("jsv/dom");
+    if (cached !== undefined) return cached;
+    const mod = createDomLibModule() as ModuleResult;
+    ctx.moduleCache.set("jsv/dom", mod);
+    return mod;
+  }
   if (
     !(specifier.startsWith("./") || specifier.startsWith("../")) ||
     !specifier.endsWith(".jsv")

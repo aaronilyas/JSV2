@@ -8,7 +8,7 @@ Use these exact targets (do not invent alternatives):
 
 - `make build` — compile `src/` to `dist/` with `tsc` (deps must already be installed)
 - `make check` — `tsc --noEmit`
-- `make test` — `node --experimental-strip-types --test tests/*.ts tests/parser/*.ts tests/checker/*.ts`
+- `make test` — `node --experimental-strip-types --test tests/*.ts tests/parser/*.ts tests/checker/*.ts tests/runtime/*.ts`
 
 ## CLI
 
@@ -33,9 +33,16 @@ Use these exact targets (do not invent alternatives):
 - Checker: `checkSource` / `checkFile` from `src/checker/check.ts`
 - `jsv check` parses then typechecks; parse errors skip the checker (no type diagnostics)
 
+## Runtime
+
+- Entry: `src/runtime/index.ts` (re-exports graph + DOM)
+- Import specifier for `.jsv`: `jsv/dom` (ambient; see `src/checker/dom-lib.ts`)
+- Signal graph: `src/runtime/graph.ts`
+- Keyed list diff: `src/runtime/reconcile.ts`
+- DOM nodes / mount / `renderToString`: `src/runtime/dom.ts`
+
 ## Later slices (do not implement here)
 
-- DOM/reactivity: `src/runtime/`
 - Go WASM: `runtime/go/` emitting `runtime/wasm/jsv.wasm`, loaded by JS (never spawn a Go process per call)
 - MCP: `src/mcp/`
 

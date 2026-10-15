@@ -11,7 +11,7 @@ Narrowing applies only to identifiers (not members):
 
 True branch of `if` / ternary consequent get the true narrow; else / alternate get the false narrow. `if (a && b)` where both sides are narrowing tests applies both in the consequent only. `while` narrows the body, not code after the loop.
 
-Imports: only `./` or `../` specifiers ending in `.jsv`, resolved with `path.resolve(dirname(file), specifier)`. Anything else is `module_not_found`. Cycles emit `import_cycle` and do not recurse. Parse errors in an import are reported; that module contributes no exports.
+Imports: only `./` or `../` specifiers ending in `.jsv`, resolved with `path.resolve(dirname(file), specifier)`, plus the ambient module `jsv/dom` (no filesystem read). Anything else is `module_not_found`. Cycles emit `import_cycle` and do not recurse. Parse errors in an import are reported; that module contributes no exports.
 
 `console` is an ambient global with `log` / `error` (any arity, args `unknown`, return `void`). A module-level binding may shadow it.
 
