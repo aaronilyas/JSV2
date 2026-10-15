@@ -47,7 +47,7 @@ Use these exact targets (do not invent alternatives):
 
 - Entry: `src/mcp/server.ts` — run with `node --experimental-strip-types src/mcp/server.ts`
 - Stdio MCP server name `jsv2`; stdout is MCP protocol only (no `console.log` on stdout)
-- Tools: `check`, `typeOf`, `suggestFix`, `domAnalyze` (no completion / full LSP)
+- Tools: `check`, `typeOf`, `complete`, `suggestFix`, `domAnalyze` (agent tools, not a full LSP)
 - DOM analysis (`src/mcp/dom-analyze.ts`) is pure AST; it must not import runtime/WASM modules
 - Details: `docs/mcp.md`
 

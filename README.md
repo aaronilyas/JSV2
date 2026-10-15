@@ -60,4 +60,4 @@ Stdio MCP server for agents (not a full LSP):
 node --experimental-strip-types src/mcp/server.ts
 ```
 
-Tools: `check`, `typeOf`, `suggestFix`, `domAnalyze`. Stdout is MCP-only. DOM analysis does not load WASM. See [docs/mcp.md](docs/mcp.md).
+Tools: `check`, `typeOf`, `complete`, `suggestFix`, `domAnalyze`. Stdout is MCP-only. DOM analysis does not load WASM. See [docs/mcp.md](docs/mcp.md).

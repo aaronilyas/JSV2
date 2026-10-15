@@ -10,6 +10,7 @@ import {
   typeAt,
 } from "../checker/check.ts";
 import { diagnosticsResult, type Diagnostic } from "../diagnostics.ts";
+import { completionsAt } from "./complete.ts";
 import { domAnalyze } from "./dom-analyze.ts";
 import { suggestFix } from "./fixes.ts";
 
@@ -139,6 +140,44 @@ export function createServer(): McpServer {
         end: hit.end,
         diagnostics,
       });
+    },
+  );
+
+  server.registerTool(
+    "complete",
+    {
+      description:
+        "Completions at a 1-based line/column: in-scope bindings, members after '.', or jsv/dom exports inside an import.",
+      inputSchema: z.object({
+        source: z.string().optional(),
+        path: z.string().optional(),
+        line: z.number().int(),
+        column: z.number().int(),
+      }),
+    },
+    (args) => {
+      const resolved = resolveSourceInput(args);
+      if (!resolved.ok) {
+        const caret = { line: args.line, column: args.column };
+        return textResult({
+          prefix: "",
+          replace: { start: caret, end: caret },
+          candidates: [],
+          diagnostics: [resolved.diagnostic],
+        });
+      }
+      const options = resolved.fromPath
+        ? undefined
+        : { readFile: () => null };
+      return textResult(
+        completionsAt(
+          resolved.source,
+          resolved.file,
+          args.line,
+          args.column,
+          options,
+        ),
+      );
     },
   );
 

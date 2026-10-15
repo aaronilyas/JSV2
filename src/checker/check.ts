@@ -2280,11 +2280,45 @@ function checkCall(
   return returnType;
 }
 
+function memberCursor(
+  expr: Extract<Expr, { kind: "member" }>,
+  line: number,
+  column: number,
+): boolean {
+  if (containsPosition(expr.propertySpan, line, column)) return true;
+  const end = expr.object.span.end;
+  const start = expr.propertySpan.start;
+  const afterObject =
+    line > end.line || (line === end.line && column > end.column);
+  const beforeProperty =
+    line < start.line || (line === start.line && column < start.column);
+  return afterObject && beforeProperty;
+}
+
+function noteMember(
+  ctx: CheckerContext,
+  expr: Extract<Expr, { kind: "member" }>,
+  objectType: Type,
+): void {
+  const cap = ctx.completion;
+  if (cap === undefined) return;
+  if (!memberCursor(expr, cap.line, cap.column)) return;
+  const extent = spanExtent(cap.source, expr.propertySpan);
+  if (cap.memberBest === null || extent < cap.memberBest.extent) {
+    cap.memberBest = {
+      extent,
+      objectType,
+      propertySpan: expr.propertySpan,
+    };
+  }
+}
+
 function checkMember(
   ctx: CheckerContext,
   expr: Extract<Expr, { kind: "member" }>,
 ): Type {
   const objType = checkExpr(ctx, expr.object, null);
+  noteMember(ctx, expr, objType);
   const prop = getProperty(objType, expr.property);
   if (prop === null) {
     if (objType.kind === "error") return ERROR_TYPE;

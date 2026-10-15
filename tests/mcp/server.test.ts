@@ -54,6 +54,7 @@ test("MCP stdio server tools and exit on client close", async () => {
     const names = tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
       "check",
+      "complete",
       "domAnalyze",
       "suggestFix",
       "typeOf",
@@ -90,6 +91,22 @@ test("MCP stdio server tools and exit on client close", async () => {
     ) as { found: boolean; type?: string };
     assert.equal(typeOf.found, true);
     assert.equal(typeOf.type, "number");
+
+    const complete = parseToolJson(
+      await client.callTool({
+        name: "complete",
+        arguments: {
+          source: 'import { signal } from "jsv/dom";\nlet s = signal<number>(0);\ns.get;\n',
+          line: 3,
+          column: 2,
+        },
+      }),
+    ) as { candidates: { name: string; kind: string }[] };
+    assert.deepEqual(
+      complete.candidates.map((c) => c.name),
+      ["get", "set", "update"],
+    );
+    assert.ok(complete.candidates.every((c) => c.kind === "member"));
 
     const fix = parseToolJson(
       await client.callTool({

@@ -1,6 +1,6 @@
 # MCP server
 
-Stdio MCP server for JSV2 language intelligence. Not a full LSP; no completion tool.
+Stdio MCP server for JSV2 language intelligence. Agent-oriented tools (including completions), not a full LSP.
 
 ## Run
 
@@ -50,6 +50,39 @@ Tool handlers return JSON as text content: `{ content: [{ type: "text", text: JS
   diagnostics: Diagnostic[]
 }
 ```
+
+### `complete`
+
+**Input:** `{ source?: string, path?: string, line: number, column: number }`
+
+`line` / `column` are 1-based; column counts UTF-16 code units and points at a character (the same coordinates as `typeOf`). The prefix is the identifier text from the token start through that character. A non-identifier character (a `.`, or whitespace) has an empty prefix, so every candidate in that context is returned.
+
+**Result:**
+
+```ts
+{
+  prefix: string,
+  replace: { start: SourcePosition, end: SourcePosition }, // half-open [start, end)
+  candidates: {
+    name: string,
+    kind: "local" | "param" | "import" | "declaration" | "ambient" | "member" | "module-export",
+    bindingKind: "value" | "type" | "both",
+    type: string,
+    optional?: boolean
+  }[],
+  diagnostics: Diagnostic[]
+}
+```
+
+Contexts, in order:
+
+| Cursor | Candidates |
+|--------|------------|
+| Inside `{ … }` of `import … from "jsv/dom"` (the imported name, not the local after `as`) | `jsv/dom` value and type exports (`kind: "module-export"`) |
+| On `.` or on the property of a member expression | Properties of the receiver’s checked type (`kind: "member"`), including `Signal` `get` / `set` / `update`, `Computed` `get`, and object or class members. `optional` is the declared optional flag; `type` is the declared property type. A union contributes only properties shared with the same type. Parse errors do not suppress this: the checker still types the partial program |
+| Anywhere else an identifier can appear | In-scope bindings: `local`, `param` (including type parameters), `import`, top-level `declaration`, and the ambient `console` |
+
+Other import statements yield no candidates. Names are filtered with `startsWith(prefix)` and sorted by name.
 
 ### `suggestFix`
 
