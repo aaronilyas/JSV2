@@ -146,7 +146,7 @@ export function createServer(): McpServer {
     "suggestFix",
     {
       description:
-        "Suggest a text edit for a diagnostic at a position (semicolon insert only).",
+        "Suggest one unambiguous text edit for a diagnostic at a position. Returns applicable:false when the edit would be a guess.",
       inputSchema: z.object({
         source: z.string().optional(),
         path: z.string().optional(),

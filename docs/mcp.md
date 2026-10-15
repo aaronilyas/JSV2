@@ -59,7 +59,17 @@ Tool handlers return JSON as text content: `{ content: [{ type: "text", text: JS
 
 `TextEdit` is `{ start: SourcePosition, end: SourcePosition, newText: string }`. Edits are not applied on disk.
 
-The only automatic edit: diagnostic `jsv.parse.unexpected_token` whose message includes `expected ';'`, matched at the given start line/column. Inserts `;` at that position (zero-width insert). Other codes (including `jsv.parse.const_missing_init`, `jsv.check.not_assignable`, `jsv.check.missing_type_arguments`) are not auto-fixable.
+`TextEdit` replaces the half-open range `[start, end)`. `start === end` inserts `newText` at that caret. Edits are not applied on disk.
+
+Fixes are conservative. `applicable` is false when the code is not fixable, the diagnostic is not at that position, or more than one edit would be reasonable.
+
+| Diagnostic | Edit |
+|------------|------|
+| `jsv.parse.unexpected_token` whose message includes `expected ';'` | Insert `;` at the diagnostic start |
+| `jsv.check.missing_type_arguments` | Insert `<...>` after the callee or type name when every type parameter is inferred from the arguments or the initializer. No edit when a parameter is unconstrained, arguments disagree, or the shapes do not match |
+| `jsv.check.unresolved_name` | Replace the identifier with the single in-scope binding at Damerau–Levenshtein distance 1 (value uses consider value bindings; type uses consider type bindings and primitive type names), **or** insert/extend an `import { … } from "jsv/dom"` when the name is exactly a `jsv/dom` export of the matching kind |
+
+A missing `const` initializer (`jsv.parse.const_missing_init`), `jsv.check.not_assignable`, and any unresolved name that is both a close in-scope typo and a `jsv/dom` export are not auto-fixable.
 
 ### `domAnalyze`
 
