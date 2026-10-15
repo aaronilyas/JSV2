@@ -1,0 +1,17 @@
+{
+  "name": "jsv2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "JSV2 — a constrained TypeScript-like language for agentic coding",
+  "bin": {
+    "jsv": "./bin/jsv.js"
+  },
+  "engines": {
+    "node": ">=23.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
