@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { checkFile, checkSource } from "../../src/checker/check.ts";
+import { checkFile, checkSource, typeAt } from "../../src/checker/check.ts";
 import type { Diagnostic } from "../../src/diagnostics.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -373,6 +373,269 @@ test("optional property write accepts undefined", () => {
       "jsv.check.not_assignable",
     ),
   );
+});
+
+function typeOf(source: string, needle: string, occurrence = 0): string {
+  let from = 0;
+  let index = -1;
+  for (let n = 0; n <= occurrence; n++) {
+    index = source.indexOf(needle, from);
+    assert.ok(index >= 0, needle);
+    from = index + needle.length;
+  }
+  let line = 1;
+  let column = 1;
+  for (let i = 0; i < index; i++) {
+    if (source.charCodeAt(i) === 10) {
+      line += 1;
+      column = 1;
+    } else {
+      column += 1;
+    }
+  }
+  const hit = typeAt(source, "t.jsv", line, column);
+  assert.ok(
+    hit.hit !== null,
+    hit.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"),
+  );
+  return hit.hit!.type;
+}
+
+test("nullish coalescing strips null and undefined", () => {
+  const same = "let x: string | null = null;\nlet y: string = x ?? \"a\";\n";
+  assert.equal(check(same).length, 0);
+  assert.equal(typeOf(same, "??"), "string");
+
+  const widened = "let x: string | null = null;\nlet y = x ?? 1;\n";
+  assert.equal(typeOf(widened, "??"), "string | number");
+
+  const kept = "let y = \"a\" ?? 1;\n";
+  assert.equal(typeOf(kept, "??"), "string");
+
+  const unknown = "let x: unknown = 1;\nlet y = x ?? \"a\";\n";
+  assert.equal(typeOf(unknown, "??"), "unknown");
+
+  assert.equal(check("let s: string = null ?? \"a\";").length, 0);
+  assert.ok(
+    hasCode(check("let s: string = (\"a\" as unknown) ?? \"b\";"), "jsv.check.not_assignable"),
+  );
+});
+
+test("optional chaining adds undefined and optional calls strip the callee", () => {
+  const read = "let o: { a: string; } | null = null;\no?.a;\n";
+  assert.equal(typeOf(read, "?.a"), "string | undefined");
+  assert.ok(hasCode(check("let o: { a: string; } | null = null; let s: string = o?.a;"), "jsv.check.not_assignable"));
+
+  const call = "let o: { m(): number; } | null = null;\nlet n: number | undefined = o?.m();\n";
+  assert.equal(check(call).length, 0);
+  assert.equal(typeOf(call, "()", 1), "number | undefined");
+
+  const opt = "interface Api { m?(): number; }\nlet o: Api = {};\nlet n: number | undefined = o.m?.();\n";
+  assert.equal(check(opt).length, 0);
+  assert.ok(hasCode(check("interface Api { m?(): number; } let o: Api = {}; o.m();"), "jsv.check.not_callable"));
+
+  const closed = "let o: { inner: { n: number; }; } | null = null;\n(o?.inner).n;\n";
+  assert.ok(hasCode(check(closed), "jsv.check.missing_property"));
+
+  const idx = "let xs: number[] | null = null;\nlet n: number | undefined = xs?.[0];\n";
+  assert.equal(check(idx).length, 0);
+
+  const generic = "function id<T>(x: T): T { return x; }\nlet n: number | undefined = id?.<number>(1);\n";
+  assert.equal(check(generic).length, 0);
+});
+
+test("optional parameters omit trailing arguments and widen inside the body", () => {
+  assert.equal(
+    check(
+      "function f(a: number, b?: string): number | undefined { return b === undefined ? a : a; } f(1); f(1, \"a\"); f(1, undefined);",
+    ).length,
+    0,
+  );
+  const arity = check("function f(a: number, b?: string): void {} f();");
+  assert.ok(hasCode(arity, "jsv.check.argument_count"));
+  assert.match(
+    arity.find((d) => d.code === "jsv.check.argument_count")!.message,
+    /Expected 1 to 2 argument\(s\)/,
+  );
+  assert.ok(
+    hasCode(
+      check("function f(x?: number): number { return x; }"),
+      "jsv.check.not_assignable",
+    ),
+  );
+  assert.equal(
+    check("let narrow: (x: number) => void = (x?: number) => {};").length,
+    0,
+  );
+  assert.ok(
+    hasCode(
+      check("let wide: (x?: number) => void = (x: number) => {};"),
+      "jsv.check.not_assignable",
+    ),
+  );
+});
+
+test("optional class fields and interface methods", () => {
+  assert.equal(
+    check(`
+class C { name?: string; }
+let c = new C();
+let s: string | undefined = c.name;
+c.name = undefined;
+c.name = "a";
+`).length,
+    0,
+  );
+  assert.ok(
+    hasCode(
+      check("class C { name?: string; } let c = new C(); let s: string = c.name;"),
+      "jsv.check.not_assignable",
+    ),
+  );
+  assert.equal(
+    check("interface Api { m?<T>(x: T): T; } let o: Api = {}; let n: number | undefined = o.m?.<number>(1);").length,
+    0,
+  );
+});
+
+test("async functions, await, and Promise", () => {
+  assert.equal(
+    check(`
+async function later(): Promise<number> { return 1; }
+async function mid(): Promise<Promise<number>> { return later(); }
+async function use(): Promise<number> {
+  let n: number = await mid();
+  return later();
+}
+export default async function main(): Promise<void> {
+  await use();
+  return;
+}
+`).length,
+    0,
+  );
+
+  assert.ok(
+    hasCode(check("async function f(): number { return 1; }"), "jsv.check.async_return"),
+  );
+  assert.ok(
+    hasCode(check("async function f(): Promise<number> {}"), "jsv.check.missing_return"),
+  );
+  assert.ok(
+    hasCode(check("async function f(): Promise<number> { return; }"), "jsv.check.not_assignable"),
+  );
+  assert.equal(check("async function f(): Promise<void> { return; }").length, 0);
+  assert.ok(
+    hasCode(check("function f(): number { return await 1; }"), "jsv.check.await_outside_async"),
+  );
+  assert.ok(hasCode(check("await 1;"), "jsv.check.await_outside_async"));
+  assert.ok(
+    hasCode(
+      check(`
+async function outer(): Promise<number> {
+  function inner(): number { return await 1; }
+  return 1;
+}
+`),
+      "jsv.check.await_outside_async",
+    ),
+  );
+  assert.ok(
+    hasCode(check("let p: Promise;"), "jsv.check.missing_type_arguments"),
+  );
+  assert.ok(
+    hasCode(
+      check("async function a(): Promise<number> { return 1; } let q: Promise<string> = a();"),
+      "jsv.check.not_assignable",
+    ),
+  );
+  assert.ok(
+    hasCode(
+      check("type Promise<T> = { value: T; }; async function f(): Promise<number> { return { value: 1 }; }"),
+      "jsv.check.async_return",
+    ),
+  );
+
+  const arrow = "let f = async () => 1;\n";
+  assert.equal(typeOf(arrow, "async"), "() => Promise<number>");
+  assert.equal(
+    check("let f: () => Promise<number> = async () => { return 1; };").length,
+    0,
+  );
+  assert.equal(
+    check(`
+class C {
+  async get(): Promise<number> { return 1; }
+}
+let c = new C();
+async function read(): Promise<number> { return await c.get(); }
+`).length,
+    0,
+  );
+});
+
+test("relative imports resolve extensionless paths and rewritten extensions", () => {
+  const files = new Map<string, string>([
+    [resolve("/virtual/a.jsv"), "export let n: number = 1;"],
+    [resolve("/virtual/pkg/index.jsv"), "export let kind: number = 1;"],
+    [resolve("/virtual/both.jsv"), "export let tag: { kind: number; } = { kind: 1 };"],
+    [resolve("/virtual/both/index.jsv"), "export let tag: { kind: string; } = { kind: \"x\" };"],
+    [
+      resolve("/virtual/main.jsv"),
+      `import { n } from "./a";
+import { n as n2 } from "./a.js";
+import { kind } from "./pkg";
+import { tag } from "./both";
+let x: number = n + n2 + kind + tag.kind;
+`,
+    ],
+  ]);
+  const { diagnostics } = checkSource(
+    files.get(resolve("/virtual/main.jsv"))!,
+    "/virtual/main.jsv",
+    { readFile: (p) => files.get(p) ?? null },
+  );
+  assert.deepEqual(
+    diagnostics,
+    [],
+    diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"),
+  );
+
+  const missing = checkSource('import { a } from "./missing";', "/virtual/main.jsv", {
+    readFile: () => null,
+  });
+  assert.match(
+    missing.diagnostics[0]?.message ?? "",
+    /Module not found: '\.\/missing'\. Looked for '\.\/missing\.jsv' or '\.\/missing\/index\.jsv'\./,
+  );
+
+  const exact = checkSource('import { a } from "./nope.jsv";', "/virtual/main.jsv", {
+    readFile: () => null,
+  });
+  assert.equal(exact.diagnostics[0]?.message, "Module not found: './nope.jsv'.");
+
+  const bare = checkSource('import { a } from "react";', "/virtual/main.jsv", {
+    readFile: () => null,
+  });
+  assert.match(bare.diagnostics[0]?.message ?? "", /Bare specifiers are not supported/);
+
+  const other = checkSource('import { a } from "./a.json";', "/virtual/main.jsv", {
+    readFile: () => null,
+  });
+  assert.match(other.diagnostics[0]?.message ?? "", /Only \.jsv modules can be imported/);
+});
+
+test("extensionless import cycle reports import_cycle", () => {
+  const files = new Map<string, string>([
+    [resolve("/virtual/a.jsv"), 'import { b } from "./b"; export let a: number = 1;'],
+    [resolve("/virtual/b.jsv"), 'import { a } from "./a.js"; export let b: number = 1;'],
+  ]);
+  const { diagnostics } = checkSource(
+    files.get(resolve("/virtual/a.jsv"))!,
+    "/virtual/a.jsv",
+    { readFile: (p) => files.get(p) ?? null },
+  );
+  assert.ok(hasCode(diagnostics, "jsv.check.import_cycle"));
 });
 
 test("console can be shadowed; ambient console is not mutable", () => {

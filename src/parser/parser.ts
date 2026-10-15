@@ -40,6 +40,8 @@ type Parser = {
   index: number;
   file: string;
   diagnostics: Diagnostic[];
+  /** Expressions whose outer parentheses were erased from the AST. */
+  grouped: Set<Expr>;
 };
 
 function current(p: Parser): Token {
@@ -339,10 +341,17 @@ function parseTypeMember(p: Parser): TypeMember {
     };
   }
   const nameTok = advance(p);
+  // `?` before type parameters: `name?: T`, `name?(): R`, `name?<T>(): R`.
+  let optional = false;
+  if (at(p, "?")) {
+    advance(p);
+    optional = true;
+  }
   const typeParams = at(p, "<") ? parseTypeParams(p) : [];
 
   if (at(p, "(") || typeParams.length > 0) {
     // Method signature. If we saw type params, `(` is required.
+    // `name?<T>(...): R` and `name?(): R` are optional methods.
     const params = parseParamList(p);
     expect(p, ":", "`:`");
     const returnType = parseType(p);
@@ -351,17 +360,12 @@ function parseTypeMember(p: Parser): TypeMember {
       kind: "method_sig",
       name: nameTok.text,
       nameSpan: tokenSpan(nameTok),
+      optional,
       typeParams,
       params,
       returnType,
       span: { start: nameTok.span.start, end: semi.span.end },
     };
-  }
-
-  let optional = false;
-  if (at(p, "?")) {
-    advance(p);
-    optional = true;
   }
   expect(p, ":", "`:`");
   const type = parseType(p);
@@ -391,16 +395,48 @@ function parseParamList(p: Parser): Param[] {
     }
   }
   expect(p, ")", "`)`");
+  reportRequiredAfterOptional(p, params);
   return params;
+}
+
+function reportRequiredAfterOptional(p: Parser, params: Param[]): void {
+  let seenOptional = false;
+  for (const param of params) {
+    if (param.optional) {
+      seenOptional = true;
+      continue;
+    }
+    if (seenOptional) {
+      diag(
+        p,
+        "jsv.parse.required_after_optional",
+        "A required parameter cannot follow an optional parameter.",
+        param.span,
+        "Move optional parameters to the end of the parameter list.",
+      );
+    }
+  }
+}
+
+function looksLikeParam(p: Parser): boolean {
+  if (!at(p, "ident")) return false;
+  if (peek(p, 1).kind === ":") return true;
+  return peek(p, 1).kind === "?" && peek(p, 2).kind === ":";
 }
 
 function parseParam(p: Parser): Param {
   const nameTok = expectIdent(p);
+  let optional = false;
+  if (at(p, "?")) {
+    advance(p);
+    optional = true;
+  }
   expect(p, ":", "`:`");
   const type = parseType(p);
   return {
     name: nameTok.text,
     nameSpan: tokenSpan(nameTok),
+    optional,
     type,
     span: { start: nameTok.span.start, end: type.span.end },
   };
@@ -433,8 +469,8 @@ function parseParenOrFunctionType(p: Parser): TypeNode {
     return { kind: "prim", name: "unknown", span: tokenSpan(current(p)) };
   }
 
-  // Look: ident :  → function params; otherwise parenthesized type
-  if (at(p, "ident") && peek(p, 1).kind === ":") {
+  // Look: ident : or ident ?:  → function params; otherwise parenthesized type
+  if (looksLikeParam(p)) {
     // Function type params — re-parse from after (
     const params: Param[] = [];
     for (;;) {
@@ -447,6 +483,7 @@ function parseParenOrFunctionType(p: Parser): TypeNode {
       break;
     }
     expect(p, ")", "`)`");
+    reportRequiredAfterOptional(p, params);
     if (!at(p, "=>")) {
       // Not a function type after all — weird. Diagnose.
       unexpected(p, "`=>`");
@@ -480,6 +517,22 @@ function parseExpr(p: Parser): Expr {
   return parseAssign(p);
 }
 
+/** `(a?.b).c = 1` is valid; `a?.b = 1` and `(a?.b) = 1` are not. */
+function invalidOptionalAssignTarget(expr: Expr): boolean {
+  if (expr.kind !== "member" && expr.kind !== "index" && expr.kind !== "call") {
+    return false;
+  }
+  if (expr.stopChain || expr.optional) return true;
+  const inner = expr.kind === "call" ? expr.callee : expr.object;
+  if (
+    (inner.kind === "member" || inner.kind === "index" || inner.kind === "call") &&
+    inner.stopChain
+  ) {
+    return false;
+  }
+  return invalidOptionalAssignTarget(inner);
+}
+
 function parseAssign(p: Parser): Expr {
   const left = parseTernary(p);
   if (at(p, "=")) {
@@ -496,6 +549,14 @@ function parseAssign(p: Parser): Expr {
         "invalid assignment target",
         left.span,
       );
+    } else if (invalidOptionalAssignTarget(left)) {
+      diag(
+        p,
+        "jsv.parse.invalid_assignment_target",
+        "invalid assignment target",
+        left.span,
+        "An optional chain cannot be assigned to. Close the chain with parentheses before a later property, for example `(obj?.inner).field = value`.",
+      );
     }
     return {
       kind: "assign",
@@ -508,7 +569,7 @@ function parseAssign(p: Parser): Expr {
 }
 
 function parseTernary(p: Parser): Expr {
-  const test = parseLogicOr(p);
+  const test = parseNullish(p);
   if (!at(p, "?")) return test;
   advance(p);
   const consequent = parseExpr(p);
@@ -521,6 +582,46 @@ function parseTernary(p: Parser): Expr {
     alternate,
     span: mergeSpan(test.span, alternate.span),
   };
+}
+
+function isUnparenthesizedLogical(p: Parser, expr: Expr): boolean {
+  if (p.grouped.has(expr)) return false;
+  return expr.kind === "binary" && (expr.op === "||" || expr.op === "&&");
+}
+
+function parseNullish(p: Parser): Expr {
+  let left = parseLogicOr(p);
+  if (!at(p, "??")) return left;
+  if (isUnparenthesizedLogical(p, left)) {
+    diag(
+      p,
+      "jsv.parse.mixed_nullish",
+      "Nullish coalescing `??` cannot be mixed with `||` or `&&` without parentheses.",
+      left.span,
+      "Wrap one side in parentheses, for example `(a && b) ?? c`.",
+    );
+  }
+  while (at(p, "??")) {
+    const op = advance(p).text as BinaryOp;
+    const right = parseLogicOr(p);
+    if (isUnparenthesizedLogical(p, right)) {
+      diag(
+        p,
+        "jsv.parse.mixed_nullish",
+        "Nullish coalescing `??` cannot be mixed with `||` or `&&` without parentheses.",
+        right.span,
+        "Wrap one side in parentheses, for example `a ?? (b || c)`.",
+      );
+    }
+    left = {
+      kind: "binary",
+      op,
+      left,
+      right,
+      span: mergeSpan(left.span, right.span),
+    };
+  }
+  return left;
 }
 
 function parseLogicOr(p: Parser): Expr {
@@ -650,6 +751,15 @@ function parseMultiplicative(p: Parser): Expr {
 }
 
 function parseUnary(p: Parser): Expr {
+  if (atKeyword(p, "await")) {
+    const opTok = advance(p);
+    const argument = parseUnary(p);
+    return {
+      kind: "await",
+      argument,
+      span: { start: opTok.span.start, end: argument.span.end },
+    };
+  }
   if (at(p, "!") || at(p, "-")) {
     const opTok = advance(p);
     const argument = parseUnary(p);
@@ -673,9 +783,92 @@ function parseUnary(p: Parser): Expr {
   return parsePostfix(p);
 }
 
+function parseOptionalCall(
+  p: Parser,
+  expr: Expr,
+  optional: boolean,
+): Expr | null {
+  if (
+    !at(p, "<") ||
+    (expr.kind !== "ident" && expr.kind !== "member")
+  ) {
+    return null;
+  }
+  const checkpoint = p.index;
+  const diagCount = p.diagnostics.length;
+  const ta = tryParseTypeArgsThenCall(p);
+  if (ta === null) {
+    p.index = checkpoint;
+    p.diagnostics.length = diagCount;
+    return null;
+  }
+  return {
+    kind: "call",
+    callee: expr,
+    typeArgs: ta.typeArgs,
+    args: ta.args,
+    optional,
+    span: { start: expr.span.start, end: ta.end },
+  };
+}
+
 function parsePostfix(p: Parser): Expr {
   let expr = parsePrimary(p);
   for (;;) {
+    if (at(p, "?.")) {
+      advance(p);
+      if (at(p, "(")) {
+        const args = parseArgList(p);
+        const end = previous(p);
+        expr = {
+          kind: "call",
+          callee: expr,
+          typeArgs: [],
+          args,
+          optional: true,
+          span: { start: expr.span.start, end: end.span.end },
+        };
+        continue;
+      }
+      if (at(p, "[")) {
+        advance(p);
+        const index = parseExpr(p);
+        const endTok = expect(p, "]", "`]`");
+        expr = {
+          kind: "index",
+          object: expr,
+          index,
+          optional: true,
+          span: { start: expr.span.start, end: endTok.span.end },
+        };
+        continue;
+      }
+      const generic = parseOptionalCall(p, expr, true);
+      if (generic !== null) {
+        expr = generic;
+        continue;
+      }
+      if (at(p, "ident")) {
+        const prop = advance(p);
+        expr = {
+          kind: "member",
+          object: expr,
+          property: prop.text,
+          propertySpan: tokenSpan(prop),
+          optional: true,
+          span: { start: expr.span.start, end: prop.span.end },
+        };
+        continue;
+      }
+      diag(
+        p,
+        "jsv.parse.optional_chain",
+        "`?.` must be followed by a property name, `[`, or `(`.",
+        tokenSpan(current(p)),
+      );
+      break;
+    }
+
     if (at(p, "(")) {
       const args = parseArgList(p);
       const end = previous(p);
@@ -684,32 +877,23 @@ function parsePostfix(p: Parser): Expr {
         callee: expr,
         typeArgs: [],
         args,
+        optional: false,
         span: { start: expr.span.start, end: end.span.end },
       };
       continue;
     }
 
     // Generic call: ident/member < TypeArgs > (
+    const generic = parseOptionalCall(p, expr, false);
+    if (generic !== null) {
+      expr = generic;
+      continue;
+    }
     if (
       at(p, "<") &&
       (expr.kind === "ident" || expr.kind === "member")
     ) {
-      const checkpoint = p.index;
-      const diagCount = p.diagnostics.length;
-      const ta = tryParseTypeArgsThenCall(p);
-      if (ta !== null) {
-        expr = {
-          kind: "call",
-          callee: expr,
-          typeArgs: ta.typeArgs,
-          args: ta.args,
-          span: { start: expr.span.start, end: ta.end },
-        };
-        continue;
-      }
-      p.index = checkpoint;
-      p.diagnostics.length = diagCount;
-      // Fall through — `<` is relational, stop postfix.
+      // `<` is relational, stop postfix.
       break;
     }
 
@@ -721,6 +905,7 @@ function parsePostfix(p: Parser): Expr {
         object: expr,
         property: prop.text,
         propertySpan: tokenSpan(prop),
+        optional: false,
         span: { start: expr.span.start, end: prop.span.end },
       };
       continue;
@@ -734,6 +919,7 @@ function parsePostfix(p: Parser): Expr {
         kind: "index",
         object: expr,
         index,
+        optional: false,
         span: { start: expr.span.start, end: endTok.span.end },
       };
       continue;
@@ -858,6 +1044,10 @@ function parsePrimary(p: Parser): Expr {
     return parseNew(p);
   }
 
+  if (atKeyword(p, "async")) {
+    return parseAsyncArrow(p);
+  }
+
   if (at(p, "ident")) {
     // Bare ident => arrow is unsupported
     if (peek(p, 1).kind === "=>") {
@@ -873,6 +1063,7 @@ function parsePrimary(p: Parser): Expr {
       const body = at(p, "{") ? parseBlock(p) : parseExpr(p);
       return {
         kind: "arrow",
+        async: false,
         params: [],
         body,
         span: {
@@ -982,6 +1173,7 @@ function parseNew(p: Parser): Expr {
         object: callee,
         property: prop.text,
         propertySpan: tokenSpan(prop),
+        optional: false,
         span: { start: callee.span.start, end: prop.span.end },
       };
     }
@@ -1101,7 +1293,7 @@ function parseParenOrArrow(p: Parser): Expr {
     if (at(p, "=>")) {
       isArrow = true;
     }
-  } else if (at(p, "ident") && peek(p, 1).kind === ":") {
+  } else if (looksLikeParam(p)) {
     isArrow = true; // likely
   }
 
@@ -1125,7 +1317,55 @@ function parseParenOrArrow(p: Parser): Expr {
     p.diagnostics.length = diagCount;
     return parseArrow(p);
   }
-  return { ...expr, span: { start: startTok.span.start, end: endTok.span.end } };
+  return groupExpr(p, expr, startTok.span.start, endTok.span.end);
+}
+
+function isOptionalChainExpr(
+  expr: Expr,
+): expr is Extract<Expr, { kind: "member" | "index" | "call" }> {
+  if (expr.kind !== "member" && expr.kind !== "index" && expr.kind !== "call") {
+    return false;
+  }
+  if (expr.optional) return true;
+  const inner = expr.kind === "call" ? expr.callee : expr.object;
+  return isOptionalChainExpr(inner);
+}
+
+/** Parentheses close an optional chain and hide `||` / `&&` from `??` mixing. */
+function groupExpr(
+  p: Parser,
+  expr: Expr,
+  start: SourcePosition,
+  end: SourcePosition,
+): Expr {
+  let grouped = expr;
+  if (isOptionalChainExpr(expr)) {
+    grouped = { ...expr, stopChain: true };
+  }
+  grouped = { ...grouped, span: { start, end } };
+  p.grouped.add(grouped);
+  return grouped;
+}
+
+function parseAsyncArrow(p: Parser): Expr {
+  const startTok = expectKeyword(p, "async");
+  if (!at(p, "(")) {
+    diag(
+      p,
+      "jsv.parse.unsupported",
+      "`async` is only allowed on functions and parenthesized arrows",
+      tokenSpan(startTok),
+      "Write `async function name(...): Promise<T>` or `async (x: T) => ...`.",
+    );
+    return { kind: "ident", name: "_", span: tokenSpan(startTok) };
+  }
+  const arrow = parseArrow(p);
+  if (arrow.kind !== "arrow") return arrow;
+  return {
+    ...arrow,
+    async: true,
+    span: { start: startTok.span.start, end: arrow.span.end },
+  };
 }
 
 function parseArrow(p: Parser): Expr {
@@ -1140,6 +1380,7 @@ function parseArrow(p: Parser): Expr {
   }
   return {
     kind: "arrow",
+    async: false,
     params,
     body,
     span: {
@@ -1185,8 +1426,13 @@ function parseStatement(p: Parser): Statement {
     return parseVar(p, false, false);
   }
 
+  if (atKeyword(p, "async") && peek(p, 1).kind === "keyword" && peek(p, 1).text === "function") {
+    const asyncTok = advance(p);
+    return parseFunction(p, false, false, true, asyncTok);
+  }
+
   if (atKeyword(p, "function")) {
-    return parseFunction(p, false, false);
+    return parseFunction(p, false, false, false);
   }
 
   if (atKeyword(p, "type")) {
@@ -1253,8 +1499,12 @@ function parseExportable(p: Parser): Statement {
     defaultExport = true;
   }
 
+  if (atKeyword(p, "async") && peek(p, 1).kind === "keyword" && peek(p, 1).text === "function") {
+    const asyncTok = advance(p);
+    return parseFunction(p, true, defaultExport, true, asyncTok);
+  }
   if (atKeyword(p, "function")) {
-    return parseFunction(p, true, defaultExport);
+    return parseFunction(p, true, defaultExport, false);
   }
   if (atKeyword(p, "class")) {
     return parseClass(p, true, defaultExport);
@@ -1443,8 +1693,13 @@ function parseFunction(
   p: Parser,
   exported: boolean,
   defaultExport: boolean,
+  isAsync: boolean,
+  startOverride?: Token,
 ): FunctionDecl {
-  const startTok = expectKeyword(p, "function");
+  const startTok = startOverride ?? expectKeyword(p, "function");
+  if (startOverride !== undefined) {
+    expectKeyword(p, "function");
+  }
   const nameTok = expectIdent(p);
   const typeParams = parseTypeParams(p);
   const params = parseParamList(p);
@@ -1470,6 +1725,7 @@ function parseFunction(
     kind: "function",
     exported,
     defaultExport,
+    async: isAsync,
     name: nameTok.text,
     nameSpan: tokenSpan(nameTok),
     typeParams,
@@ -1597,7 +1853,7 @@ function parseClassMember(p: Parser): ClassMember {
     };
   }
 
-  if (!at(p, "ident")) {
+  if (!at(p, "ident") && !atKeyword(p, "async")) {
     const tok = current(p);
     unexpected(p, "identifier");
     recoverMember(p);
@@ -1605,14 +1861,40 @@ function parseClassMember(p: Parser): ClassMember {
       kind: "field",
       name: "_",
       nameSpan: tokenSpan(tok),
+      optional: false,
       type: { kind: "prim", name: "unknown", span: tokenSpan(tok) },
       span: tokenSpan(tok),
     };
   }
-  const nameTok = advance(p);
+
+  let isAsync = false;
+  let memberStart = current(p);
+  if (atKeyword(p, "async")) {
+    memberStart = advance(p);
+    isAsync = true;
+  }
+
+  const nameTok = expectIdent(p);
+  // `?` before type parameters, matching interface members: `name?: T`, `name?(): R`.
+  let optional = false;
+  if (!isAsync && at(p, "?")) {
+    const qTok = current(p);
+    advance(p);
+    if (at(p, "(") || at(p, "<")) {
+      diag(
+        p,
+        "jsv.parse.unsupported",
+        "optional methods are not supported on classes",
+        tokenSpan(qTok),
+        "Optional methods are allowed on interfaces and object types. Class fields use `name?: Type;`.",
+      );
+    } else {
+      optional = true;
+    }
+  }
   const typeParams = at(p, "<") ? parseTypeParams(p) : [];
 
-  if (at(p, "(") || typeParams.length > 0) {
+  if (at(p, "(") || typeParams.length > 0 || isAsync) {
     const params = parseParamList(p);
     if (!at(p, ":")) {
       diag(
@@ -1636,11 +1918,12 @@ function parseClassMember(p: Parser): ClassMember {
       kind: "method",
       name: nameTok.text,
       nameSpan: tokenSpan(nameTok),
+      async: isAsync,
       typeParams,
       params,
       returnType,
       body,
-      span: { start: nameTok.span.start, end: body.span.end },
+      span: { start: memberStart.span.start, end: body.span.end },
     };
   }
 
@@ -1663,6 +1946,7 @@ function parseClassMember(p: Parser): ClassMember {
     kind: "field",
     name: nameTok.text,
     nameSpan: tokenSpan(nameTok),
+    optional,
     type,
     span: { start: nameTok.span.start, end: semi.span.end },
   };
@@ -1763,6 +2047,7 @@ export function parseTokens(
     index: 0,
     file,
     diagnostics: [...lexerDiagnostics],
+    grouped: new Set(),
   };
 
   const body: Statement[] = [];

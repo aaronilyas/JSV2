@@ -47,6 +47,8 @@ export type VarStmt = {
 export type Param = {
   name: string;
   nameSpan: Span;
+  /** When true, callers may omit the argument and the binding includes `undefined`. */
+  optional: boolean;
   type: TypeNode;
   span: Span;
 };
@@ -55,6 +57,7 @@ export type FunctionDecl = {
   kind: "function";
   exported: boolean;
   defaultExport: boolean;
+  async: boolean;
   name: string;
   nameSpan: Span;
   typeParams: { name: string; span: Span }[];
@@ -87,6 +90,7 @@ export type TypeMember =
       kind: "method_sig";
       name: string;
       nameSpan: Span;
+      optional: boolean;
       typeParams: { name: string; span: Span }[];
       params: Param[];
       returnType: TypeNode;
@@ -108,6 +112,7 @@ export type ClassMember =
       kind: "field";
       name: string;
       nameSpan: Span;
+      optional: boolean;
       type: TypeNode;
       span: Span;
     }
@@ -121,6 +126,7 @@ export type ClassMember =
       kind: "method";
       name: string;
       nameSpan: Span;
+      async: boolean;
       typeParams: { name: string; span: Span }[];
       params: Param[];
       returnType: TypeNode;
@@ -277,6 +283,10 @@ export type Expr =
       callee: Expr;
       typeArgs: TypeNode[];
       args: Expr[];
+      /** True for `callee?.()`. Later postfix continues the chain until parentheses close it. */
+      optional: boolean;
+      /** Set when parentheses closed an optional chain, so the next postfix is not part of it. */
+      stopChain?: boolean;
       span: Span;
     }
   | {
@@ -284,12 +294,18 @@ export type Expr =
       object: Expr;
       property: string;
       propertySpan: Span;
+      /** True for `object?.property`. */
+      optional: boolean;
+      stopChain?: boolean;
       span: Span;
     }
   | {
       kind: "index";
       object: Expr;
       index: Expr;
+      /** True for `object?.[index]`. */
+      optional: boolean;
+      stopChain?: boolean;
       span: Span;
     }
   | {
@@ -301,8 +317,14 @@ export type Expr =
     }
   | {
       kind: "arrow";
+      async: boolean;
       params: Param[];
       body: Expr | Block;
+      span: Span;
+    }
+  | {
+      kind: "await";
+      argument: Expr;
       span: Span;
     }
   | {
@@ -313,6 +335,7 @@ export type Expr =
     };
 
 export type BinaryOp =
+  | "??"
   | "||"
   | "&&"
   | "=="

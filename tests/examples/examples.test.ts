@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  mkdirSync,
   mkdtempSync,
   rmSync,
   writeFileSync,
@@ -342,6 +343,96 @@ test("bare let under while does not throw", async () => {
   );
   assert.equal(r.code, 0);
   assert.deepEqual(r.logs, [0]);
+});
+
+test("optional chaining, nullish coalescing, and async run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "jsv-ex-"));
+  const logs: unknown[] = [];
+  const originalLog = console.log;
+  try {
+    writeFileSync(
+      join(dir, "t.jsv"),
+      `function greet(name?: string): string {
+  return name ?? "world";
+}
+class Box {
+  n: number;
+  constructor(n: number) {
+    this.n = n;
+  }
+  get(): number {
+    return this.n;
+  }
+}
+async function later(): Promise<number> {
+  return 2;
+}
+export async function main(): Promise<void> {
+  let box: Box | null = new Box(6);
+  let missing: Box | null = null;
+  let xs: number[] | null = [9];
+  let flag: boolean = (false || false) ?? true;
+  let o: { inner: { n: number; }; } | null = { inner: { n: 3 } };
+  console.log(greet());
+  console.log(greet("ada"));
+  console.log(box?.get() ?? 0);
+  console.log(missing?.get() ?? 0);
+  console.log(xs?.[0] ?? 0);
+  console.log(flag);
+  console.log((o?.inner)?.n ?? 0);
+  let n: number = await later();
+  console.log(n);
+}
+`,
+    );
+    console.log = (...args: unknown[]) => {
+      logs.push(...args);
+    };
+    const { namespace, cleanup } = await loadModule(join(dir, "t.jsv"));
+    try {
+      const main = namespace["main"] as () => Promise<void>;
+      await main();
+      assert.deepEqual(logs, ["world", "ada", 6, 0, 9, false, 3, 2]);
+    } finally {
+      await cleanup();
+    }
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rewritten and extensionless imports run the resolved module", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "jsv-ex-"));
+  const logs: unknown[] = [];
+  const originalLog = console.log;
+  try {
+    writeFileSync(join(dir, "lib.jsv"), "export let n: number = 4;\n");
+    writeFileSync(join(dir, "both.jsv"), "export let n: number = 7;\n");
+    mkdirSync(join(dir, "both"));
+    writeFileSync(join(dir, "both", "index.jsv"), "export let n: number = 8;\n");
+    mkdirSync(join(dir, "pkg"));
+    writeFileSync(join(dir, "pkg", "index.jsv"), "export let n: number = 5;\n");
+    writeFileSync(
+      join(dir, "main.jsv"),
+      `import { n as fromJs } from "./lib.js";
+import { n as fromIndex } from "./pkg";
+import { n as fromFile } from "./both";
+console.log(fromJs);
+console.log(fromIndex);
+console.log(fromFile);
+`,
+    );
+    console.log = (...args: unknown[]) => {
+      logs.push(...args);
+    };
+    const code = await runFile(join(dir, "main.jsv"));
+    assert.equal(code, 0);
+    assert.deepEqual(logs, [4, 5, 7]);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("bare function under if is wrapped and runs", async () => {

@@ -360,6 +360,157 @@ test("bad object-type member recovers; later prop kept", () => {
   }
 });
 
+test("optional chaining, nullish coalescing, and async parse", () => {
+  const chain = exprStmt(parse("a?.b?.c;", "t.jsv").program.body);
+  assert.equal(chain.kind, "member");
+  if (chain.kind === "member") {
+    assert.equal(chain.optional, true);
+    assert.equal(chain.property, "c");
+    assert.equal(chain.object.kind, "member");
+    if (chain.object.kind === "member") assert.equal(chain.object.optional, true);
+  }
+
+  const call = exprStmt(parse("a?.b();", "t.jsv").program.body);
+  assert.equal(call.kind, "call");
+  if (call.kind === "call") {
+    assert.equal(call.optional, false);
+    assert.equal(call.callee.kind, "member");
+    if (call.callee.kind === "member") assert.equal(call.callee.optional, true);
+  }
+
+  const optCall = exprStmt(parse("fn?.();", "t.jsv").program.body);
+  assert.equal(optCall.kind, "call");
+  if (optCall.kind === "call") assert.equal(optCall.optional, true);
+
+  const index = exprStmt(parse("xs?.[0];", "t.jsv").program.body);
+  assert.equal(index.kind, "index");
+  if (index.kind === "index") assert.equal(index.optional, true);
+
+  const coalesced = exprStmt(parse("a ?? b ?? c;", "t.jsv").program.body);
+  assert.equal(coalesced.kind, "binary");
+  if (coalesced.kind === "binary") {
+    assert.equal(coalesced.op, "??");
+    assert.equal(coalesced.left.kind, "binary");
+    if (coalesced.left.kind === "binary") assert.equal(coalesced.left.op, "??");
+  }
+
+  const tighter = exprStmt(parse("1 + 2 ?? 3;", "t.jsv").program.body);
+  assert.equal(tighter.kind, "binary");
+  if (tighter.kind === "binary") {
+    assert.equal(tighter.op, "??");
+    assert.equal(tighter.left.kind, "binary");
+  }
+
+  const mixed = parse("a ?? b || c;", "t.jsv");
+  assert.ok(mixed.diagnostics.some((d) => d.code === "jsv.parse.mixed_nullish"));
+
+  const grouped = parse("(a || b) ?? c;", "t.jsv");
+  assert.equal(grouped.diagnostics.length, 0);
+  const groupedExpr = exprStmt(grouped.program.body);
+  assert.equal(groupedExpr.kind, "binary");
+  if (groupedExpr.kind === "binary") {
+    assert.equal(groupedExpr.op, "??");
+    assert.equal(groupedExpr.left.kind, "binary");
+  }
+
+  const assign = parse("a?.b = 1;", "t.jsv");
+  assert.ok(
+    assign.diagnostics.some((d) => d.code === "jsv.parse.invalid_assignment_target"),
+  );
+
+  const closed = parse("(a?.b).c = 1;", "t.jsv");
+  assert.equal(closed.diagnostics.length, 0);
+  const closedExpr = exprStmt(closed.program.body);
+  assert.equal(closedExpr.kind, "assign");
+  if (closedExpr.kind === "assign" && closedExpr.target.kind === "member") {
+    assert.equal(closedExpr.target.optional, false);
+    assert.equal(closedExpr.target.object.kind, "member");
+    if (closedExpr.target.object.kind === "member") {
+      assert.equal(closedExpr.target.object.stopChain, true);
+    }
+  }
+
+  const bare = parse("a?.;", "t.jsv");
+  assert.ok(bare.diagnostics.some((d) => d.code === "jsv.parse.optional_chain"));
+});
+
+test("optional parameters, async functions, and class members", () => {
+  const fn = parse(
+    "async function f(x?: number): Promise<number> { return x ?? 0; }",
+    "t.jsv",
+  );
+  assert.equal(fn.diagnostics.length, 0);
+  const decl = fn.program.body[0];
+  assert.equal(decl?.kind, "function");
+  if (decl?.kind === "function") {
+    assert.equal(decl.async, true);
+    assert.equal(decl.params[0]?.optional, true);
+  }
+
+  const order = parse(
+    "function f(a?: number, b: number): void {}",
+    "t.jsv",
+  );
+  assert.ok(
+    order.diagnostics.some((d) => d.code === "jsv.parse.required_after_optional"),
+  );
+
+  const arrow = parse("let f = async (x?: number) => x ?? 0;", "t.jsv");
+  assert.equal(arrow.diagnostics.length, 0);
+  const arrowStmt = arrow.program.body[0];
+  assert.equal(arrowStmt?.kind, "var");
+  if (arrowStmt?.kind === "var" && arrowStmt.init?.kind === "arrow") {
+    assert.equal(arrowStmt.init.async, true);
+    assert.equal(arrowStmt.init.params[0]?.optional, true);
+  }
+
+  const badAsync = parse("async 1;", "t.jsv");
+  assert.ok(badAsync.diagnostics.some((d) => d.code === "jsv.parse.unsupported"));
+
+  const cls = parse(
+    `class C {
+  name?: string;
+  async get(): Promise<number> { return 1; }
+}`,
+    "t.jsv",
+  );
+  assert.equal(cls.diagnostics.length, 0);
+  const classDecl = cls.program.body[0];
+  assert.equal(classDecl?.kind, "class");
+  if (classDecl?.kind === "class") {
+    assert.equal(classDecl.members[0]?.kind, "field");
+    if (classDecl.members[0]?.kind === "field") {
+      assert.equal(classDecl.members[0].optional, true);
+    }
+    assert.equal(classDecl.members[1]?.kind, "method");
+    if (classDecl.members[1]?.kind === "method") {
+      assert.equal(classDecl.members[1].async, true);
+    }
+  }
+
+  const optMethod = parse("class C { m?(): void {} m?<T>(x: T): T { return x; } }", "t.jsv");
+  assert.ok(
+    optMethod.diagnostics.filter((d) => d.code === "jsv.parse.unsupported").length >= 2,
+  );
+
+  const iface = parse(
+    "interface I { n?: string; m?<T>(x: T): T; }",
+    "t.jsv",
+  );
+  assert.equal(iface.diagnostics.length, 0);
+  const idecl = iface.program.body[0];
+  assert.equal(idecl?.kind, "interface");
+  if (idecl?.kind === "interface") {
+    assert.equal(idecl.members[0]?.kind, "prop");
+    if (idecl.members[0]?.kind === "prop") assert.equal(idecl.members[0].optional, true);
+    assert.equal(idecl.members[1]?.kind, "method_sig");
+    if (idecl.members[1]?.kind === "method_sig") {
+      assert.equal(idecl.members[1].optional, true);
+      assert.equal(idecl.members[1].typeParams.length, 1);
+    }
+  }
+});
+
 test("empty class and valid interface still clean", () => {
   assert.equal(parse("class C { }", "t.jsv").diagnostics.length, 0);
   assert.equal(

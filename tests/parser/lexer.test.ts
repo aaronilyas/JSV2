@@ -69,8 +69,17 @@ test("template with interpolation", () => {
 });
 
 test("keywords are not identifiers", () => {
-  const { tokens } = tokenize("from as new", "t.jsv");
+  const { tokens } = tokenize("from as new async await", "t.jsv");
   assert.ok(tokens.every((t) => t.kind === "keyword" || t.kind === "eof"));
+});
+
+test("?. and ?? are single tokens", () => {
+  const { tokens, diagnostics } = tokenize("a?.b ?? c", "t.jsv");
+  assert.equal(diagnostics.length, 0);
+  assert.deepEqual(
+    tokens.map((t) => t.kind),
+    ["ident", "?.", "ident", "??", "ident", "eof"],
+  );
 });
 
 test("spans are 1-based inclusive", () => {

@@ -1,13 +1,16 @@
 import {
+  existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { checkFile } from "../checker/check.ts";
+import { resolveExistingModule } from "../checker/resolve-module.ts";
 import {
   type Diagnostic,
   diagnosticsResult,
@@ -45,6 +48,14 @@ function readSource(absolutePath: string): string {
   return readFileSync(absolutePath, "utf8");
 }
 
+function isJsFile(absolute: string): boolean {
+  try {
+    return existsSync(absolute) && statSync(absolute).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function collectModules(
   entryAbs: string,
 ): Map<string, { program: Program; outName: string }> {
@@ -72,9 +83,8 @@ function collectModules(
       if (stmt.kind !== "import") continue;
       const spec = stmt.moduleSpecifier;
       if (spec === "jsv/dom") continue;
-      if (spec.startsWith("./") || spec.startsWith("../")) {
-        queue.push(resolve(dirname(file), spec));
-      }
+      const resolved = resolveExistingModule(file, spec, isJsFile);
+      if (resolved !== null) queue.push(resolved.absolute);
     }
   }
 
@@ -95,7 +105,8 @@ function emitOptionsFor(
           hasDefault: false,
         };
       }
-      const abs = resolve(dirname(file), moduleSpecifier);
+      const resolved = resolveExistingModule(file, moduleSpecifier, isJsFile);
+      const abs = resolved?.absolute ?? resolve(dirname(file), moduleSpecifier);
       const dep = modules.get(abs);
       if (dep === undefined) {
         return {

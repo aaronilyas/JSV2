@@ -178,6 +178,7 @@ function walkExpr(expr: Expr, state: WalkState): void {
       for (const p of expr.properties) walkExpr(p.value, state);
       return;
     case "unary":
+    case "await":
       walkExpr(expr.argument, state);
       return;
     case "binary":
@@ -383,6 +384,7 @@ function collectSignalAccesses(
       }
       return;
     case "unary":
+    case "await":
       collectSignalAccesses(expr.argument, reads, writes);
       return;
     case "binary":
@@ -536,6 +538,7 @@ function identReferenced(node: Expr | Block | Statement, name: string): boolean 
     case "object":
       return expr.properties.some((p) => identReferenced(p.value, name));
     case "unary":
+    case "await":
       return identReferenced(expr.argument, name);
     case "binary":
       return (

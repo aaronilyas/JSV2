@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { Diagnostic, SourcePosition } from "../diagnostics.ts";
 import { parse } from "../parser/parse.ts";
 import type {
@@ -19,7 +19,9 @@ import type {
 import { createDomLibModule } from "./dom-lib.ts";
 import {
   ERROR_TYPE,
+  PROMISE_DEF,
   arrayType,
+  awaitType,
   excludeType,
   functionType,
   getProperty,
@@ -32,6 +34,8 @@ import {
   objectType,
   optionalReadType,
   prim,
+  promiseInner,
+  promiseType,
   propertyNames,
   refType,
   substitute,
@@ -44,6 +48,10 @@ import {
   type Type,
   type TypeDef,
 } from "./types.ts";
+import {
+  resolveExistingModule,
+  unresolvedModuleMessage,
+} from "./resolve-module.ts";
 
 export type TypeArgHint = {
   /** Diagnostic start (1-based). */
@@ -130,6 +138,10 @@ type CheckerContext = {
   scope: Scope;
   narrowing: NarrowMap;
   returnType: Type | null;
+  /** When true, `return expr` may be `T` or `Promise<T>` and `returnType` is `T`. */
+  asyncFn: boolean;
+  /** When true, `await` is allowed in this function. */
+  inAsync: boolean;
   thisType: Type | null;
   inExprStmt: boolean;
   typeArgHints?: TypeArgHint[];
@@ -308,6 +320,31 @@ function withNarrowing<T>(
 
 // --- Type resolution --------------------------------------------------------
 
+function fnParamsFrom(
+  ctx: CheckerContext,
+  params: { name: string; optional: boolean; type: TypeNode }[],
+  typeParamNames: Set<string>,
+): FnParamType[] {
+  return params.map((p) => {
+    const out: FnParamType = {
+      name: p.name,
+      type: resolveTypeNode(ctx, p.type, typeParamNames),
+    };
+    if (p.optional) out.optional = true;
+    return out;
+  });
+}
+
+function paramExpected(p: FnParamType): Type {
+  return p.optional === true ? optionalReadType(p.type) : p.type;
+}
+
+function minArity(params: readonly FnParamType[]): number {
+  let i = params.length;
+  while (i > 0 && params[i - 1]?.optional === true) i -= 1;
+  return i;
+}
+
 function resolveTypeMembers(
   ctx: CheckerContext,
   members: TypeMember[],
@@ -326,12 +363,9 @@ function resolveTypeMembers(
       const inner = new Set([...typeParamNames, ...tpNames]);
       props.push({
         name: m.name,
-        optional: false,
+        optional: m.optional,
         type: functionType(
-          m.params.map((p) => ({
-            name: p.name,
-            type: resolveTypeNode(ctx, p.type, inner),
-          })),
+          fnParamsFrom(ctx, m.params, inner),
           resolveTypeNode(ctx, m.returnType, inner),
           tpNames,
         ),
@@ -371,10 +405,7 @@ function resolveTypeNodeBody(
       return objectType(resolveTypeMembers(ctx, node.members, typeParamNames));
     case "function":
       return functionType(
-        node.params.map((p) => ({
-          name: p.name,
-          type: resolveTypeNode(ctx, p.type, typeParamNames),
-        })),
+        fnParamsFrom(ctx, node.params, typeParamNames),
         resolveTypeNode(ctx, node.returnType, typeParamNames),
       );
     case "named": {
@@ -554,12 +585,25 @@ function checkModule(
               valueType: consoleType(),
             },
           ],
+          [
+            "Promise",
+            {
+              name: "Promise",
+              kind: "type" as const,
+              origin: "ambient",
+              mutable: false,
+              valueType: ERROR_TYPE,
+              typeDef: PROMISE_DEF,
+            },
+          ],
         ]),
         parent: null,
       },
     },
     narrowing: new Map(),
     returnType: null,
+    asyncFn: false,
+    inAsync: false,
     thisType: null,
     inExprStmt: false,
     typeQuery,
@@ -695,10 +739,7 @@ function fillFunctionType(ctx: CheckerContext, stmt: FunctionDecl): void {
   const tpNames = stmt.typeParams.map((t) => t.name);
   const tpSet = new Set(tpNames);
   binding.valueType = functionType(
-    stmt.params.map((p) => ({
-      name: p.name,
-      type: resolveTypeNode(ctx, p.type, tpSet),
-    })),
+    fnParamsFrom(ctx, stmt.params, tpSet),
     resolveTypeNode(ctx, stmt.returnType, tpSet),
     tpNames,
   );
@@ -735,7 +776,7 @@ function fillClass(ctx: CheckerContext, stmt: ClassDecl): void {
     if (m.kind === "field") {
       props.push({
         name: m.name,
-        optional: false,
+        optional: m.optional,
         type: resolveTypeNode(ctx, m.type),
       });
     } else if (m.kind === "method") {
@@ -745,10 +786,7 @@ function fillClass(ctx: CheckerContext, stmt: ClassDecl): void {
         name: m.name,
         optional: false,
         type: functionType(
-          m.params.map((p) => ({
-            name: p.name,
-            type: resolveTypeNode(ctx, p.type, tpSet),
-          })),
+          fnParamsFrom(ctx, m.params, tpSet),
           resolveTypeNode(ctx, m.returnType, tpSet),
           tpNames,
         ),
@@ -763,10 +801,7 @@ function fillClass(ctx: CheckerContext, stmt: ClassDecl): void {
           m.span,
         );
       } else {
-        ctorParams = m.params.map((p) => ({
-          name: p.name,
-          type: resolveTypeNode(ctx, p.type),
-        }));
+        ctorParams = fnParamsFrom(ctx, m.params, new Set());
       }
     }
   }
@@ -824,19 +859,18 @@ function resolveAndLoadModule(
     ctx.moduleCache.set("jsv/dom", mod);
     return mod;
   }
-  if (
-    !(specifier.startsWith("./") || specifier.startsWith("../")) ||
-    !specifier.endsWith(".jsv")
-  ) {
-    diag(
-      ctx,
-      "jsv.check.module_not_found",
-      `Module not found: '${specifier}'.`,
-      span,
-    );
+  const resolved = resolveExistingModule(ctx.file, specifier, (absolute) => {
+    if (ctx.checkingStack.has(absolute) || ctx.moduleCache.has(absolute)) {
+      return true;
+    }
+    return ctx.readFile(absolute) !== null;
+  });
+  if (resolved === null) {
+    const missing = unresolvedModuleMessage(specifier);
+    diag(ctx, "jsv.check.module_not_found", missing.message, span, missing.hint);
     return null;
   }
-  const absolute = resolve(dirname(ctx.file), specifier);
+  const absolute = resolved.absolute;
   if (ctx.checkingStack.has(absolute)) {
     diag(
       ctx,
@@ -851,12 +885,8 @@ function resolveAndLoadModule(
 
   const source = ctx.readFile(absolute);
   if (source === null) {
-    diag(
-      ctx,
-      "jsv.check.module_not_found",
-      `Module not found: '${specifier}'.`,
-      span,
-    );
+    const missing = unresolvedModuleMessage(specifier);
+    diag(ctx, "jsv.check.module_not_found", missing.message, span, missing.hint);
     return null;
   }
   return checkModule(
@@ -1144,10 +1174,13 @@ function bindTypeParams(
   return names;
 }
 
-function checkFunctionBody(ctx: CheckerContext, stmt: FunctionDecl): void {
-  pushScope(ctx);
-  const tpSet = bindTypeParams(ctx, stmt.typeParams);
-  for (const p of stmt.params) {
+function bindValueParams(
+  ctx: CheckerContext,
+  params: { name: string; nameSpan: Span; optional: boolean; type: TypeNode }[],
+  typeParamNames: Set<string>,
+): void {
+  for (const p of params) {
+    const declared = resolveTypeNode(ctx, p.type, typeParamNames);
     declareInScope(
       ctx,
       {
@@ -1155,20 +1188,55 @@ function checkFunctionBody(ctx: CheckerContext, stmt: FunctionDecl): void {
         kind: "value",
         origin: "param",
         mutable: true,
-        valueType: resolveTypeNode(ctx, p.type, tpSet),
+        valueType: p.optional ? optionalReadType(declared) : declared,
       },
       p.nameSpan,
     );
   }
+}
+
+function asyncReturnInner(
+  ctx: CheckerContext,
+  annotated: Type,
+  span: Span,
+): Type {
+  const inner = promiseInner(annotated);
+  if (inner !== null) return inner;
+  diag(
+    ctx,
+    "jsv.check.async_return",
+    `The return type of an async function must be 'Promise<T>', but got '${typeToString(annotated)}'.`,
+    span,
+    "Annotate the return type as Promise<T>. The body may return T or Promise<T>.",
+  );
+  return ERROR_TYPE;
+}
+
+function checkFunctionBody(ctx: CheckerContext, stmt: FunctionDecl): void {
+  pushScope(ctx);
+  const tpSet = bindTypeParams(ctx, stmt.typeParams);
+  bindValueParams(ctx, stmt.params, tpSet);
   captureScope(ctx, stmt.span);
-  const returnType = resolveTypeNode(ctx, stmt.returnType, tpSet);
+  const annotated = resolveTypeNode(ctx, stmt.returnType, tpSet);
   const prevRet = ctx.returnType;
-  ctx.returnType = returnType;
+  const prevAsyncFn = ctx.asyncFn;
+  const prevInAsync = ctx.inAsync;
+  ctx.inAsync = stmt.async;
+  if (stmt.async) {
+    ctx.asyncFn = true;
+    ctx.returnType = asyncReturnInner(ctx, annotated, stmt.returnType.span);
+  } else {
+    ctx.asyncFn = false;
+    ctx.returnType = annotated;
+  }
   const definitelyReturns = checkBlock(ctx, stmt.body);
+  const checkedReturn = ctx.returnType;
   ctx.returnType = prevRet;
+  ctx.asyncFn = prevAsyncFn;
+  ctx.inAsync = prevInAsync;
   popScope(ctx);
 
-  if (!isVoid(returnType) && !isNever(returnType) && !definitelyReturns) {
+  if (!isVoid(checkedReturn) && !isNever(checkedReturn) && !definitelyReturns) {
     diag(
       ctx,
       "jsv.check.missing_return",
@@ -1189,55 +1257,53 @@ function checkClassBodies(ctx: CheckerContext, stmt: ClassDecl): void {
     if (m.kind === "field") continue;
     if (m.kind === "constructor") {
       pushScope(ctx);
-      for (const p of m.params) {
-        declareInScope(
-          ctx,
-          {
-            name: p.name,
-            kind: "value",
-            origin: "param",
-            mutable: true,
-            valueType: resolveTypeNode(ctx, p.type),
-          },
-          p.nameSpan,
-        );
-      }
+      bindValueParams(ctx, m.params, new Set());
       captureScope(ctx, m.span);
       const prevThis = ctx.thisType;
       const prevRet = ctx.returnType;
+      const prevAsyncFn = ctx.asyncFn;
+      const prevInAsync = ctx.inAsync;
       ctx.thisType = instance;
       ctx.returnType = prim("void");
+      ctx.asyncFn = false;
+      ctx.inAsync = false;
       checkBlock(ctx, m.body);
       ctx.thisType = prevThis;
       ctx.returnType = prevRet;
+      ctx.asyncFn = prevAsyncFn;
+      ctx.inAsync = prevInAsync;
       popScope(ctx);
     } else if (m.kind === "method") {
       pushScope(ctx);
       const tpSet = bindTypeParams(ctx, m.typeParams);
-      for (const p of m.params) {
-        declareInScope(
-          ctx,
-          {
-            name: p.name,
-            kind: "value",
-            origin: "param",
-            mutable: true,
-            valueType: resolveTypeNode(ctx, p.type, tpSet),
-          },
-          p.nameSpan,
-        );
-      }
+      bindValueParams(ctx, m.params, tpSet);
       captureScope(ctx, m.span);
-      const returnType = resolveTypeNode(ctx, m.returnType, tpSet);
+      const annotated = resolveTypeNode(ctx, m.returnType, tpSet);
       const prevThis = ctx.thisType;
       const prevRet = ctx.returnType;
+      const prevAsyncFn = ctx.asyncFn;
+      const prevInAsync = ctx.inAsync;
       ctx.thisType = instance;
-      ctx.returnType = returnType;
+      ctx.inAsync = m.async;
+      if (m.async) {
+        ctx.asyncFn = true;
+        ctx.returnType = asyncReturnInner(ctx, annotated, m.returnType.span);
+      } else {
+        ctx.asyncFn = false;
+        ctx.returnType = annotated;
+      }
       const definitelyReturns = checkBlock(ctx, m.body);
+      const checkedReturn = ctx.returnType;
       ctx.thisType = prevThis;
       ctx.returnType = prevRet;
+      ctx.asyncFn = prevAsyncFn;
+      ctx.inAsync = prevInAsync;
       popScope(ctx);
-      if (!isVoid(returnType) && !isNever(returnType) && !definitelyReturns) {
+      if (
+        !isVoid(checkedReturn) &&
+        !isNever(checkedReturn) &&
+        !definitelyReturns
+      ) {
         diag(
           ctx,
           "jsv.check.missing_return",
@@ -1306,7 +1372,10 @@ function checkReturn(
     return;
   }
   if (stmt.argument === null) {
-    if (!isVoid(ctx.returnType)) {
+    const bareOk =
+      isVoid(ctx.returnType) ||
+      (ctx.asyncFn && isUndefinedType(ctx.returnType));
+    if (!bareOk) {
       diag(
         ctx,
         "jsv.check.not_assignable",
@@ -1317,7 +1386,7 @@ function checkReturn(
     return;
   }
   const argType = checkExpr(ctx, stmt.argument, ctx.returnType);
-  if (isVoid(argType) && !isVoid(ctx.returnType)) {
+  if (isVoid(argType) && !isVoid(ctx.returnType) && !ctx.asyncFn) {
     diag(
       ctx,
       "jsv.check.void_value",
@@ -1326,7 +1395,26 @@ function checkReturn(
     );
     return;
   }
+  if (ctx.asyncFn) {
+    if (ctx.returnType.kind === "error" || argType.kind === "error") return;
+    const wrapped = promiseType(ctx.returnType);
+    if (isAssignable(argType, ctx.returnType) || isAssignable(argType, wrapped)) {
+      return;
+    }
+    diag(
+      ctx,
+      "jsv.check.not_assignable",
+      `Type '${typeToString(argType)}' is not assignable to type '${typeToString(ctx.returnType)}' or '${typeToString(wrapped)}'.`,
+      stmt.argument.span,
+    );
+    return;
+  }
   checkAssignability(ctx, argType, ctx.returnType, stmt.argument.span);
+}
+
+function isUndefinedType(type: Type): boolean {
+  const t = unwrap(type);
+  return t.kind === "prim" && t.name === "undefined";
 }
 
 function checkCondition(ctx: CheckerContext, expr: Expr): void {
@@ -1482,17 +1570,93 @@ function tryTypeofNarrow(
 
 // --- Expressions ------------------------------------------------------------
 
+type ChainInfo = {
+  /** Type of the expression, including `undefined` from an open optional chain. */
+  type: Type;
+  /** Type if every `?.` in the open chain continued. Optional properties still include `undefined`. */
+  direct: Type;
+  inChain: boolean;
+};
+
 function checkExpr(
   ctx: CheckerContext,
   expr: Expr,
   expected: Type | null,
 ): Type {
+  return checkChain(ctx, expr, expected).type;
+}
+
+function checkChain(
+  ctx: CheckerContext,
+  expr: Expr,
+  expected: Type | null,
+): ChainInfo {
   captureScope(ctx, expr.span);
-  const type = checkExprBody(ctx, expr, expected);
+  const info = finishChain(checkChainBody(ctx, expr, expected), expr);
   if (ctx.typeQuery !== undefined) {
-    ctx.typeQuery.hits.push({ span: expr.span, type });
+    ctx.typeQuery.hits.push({ span: expr.span, type: info.type });
   }
-  return type;
+  return info;
+}
+
+function finishChain(info: ChainInfo, expr: Expr): ChainInfo {
+  if (
+    (expr.kind === "member" || expr.kind === "index" || expr.kind === "call") &&
+    expr.stopChain === true
+  ) {
+    return { type: info.type, direct: info.type, inChain: false };
+  }
+  return info;
+}
+
+function chainCalleeType(info: ChainInfo, optional: boolean): Type {
+  if (optional) return stripNullish(info.direct).type;
+  if (info.inChain) return info.direct;
+  return info.type;
+}
+
+function checkChainBody(
+  ctx: CheckerContext,
+  expr: Expr,
+  expected: Type | null,
+): ChainInfo {
+  switch (expr.kind) {
+    case "member":
+      return checkMemberChain(ctx, expr);
+    case "index":
+      return checkIndexChain(ctx, expr);
+    case "call":
+      return checkCallChain(ctx, expr);
+    default: {
+      const type = checkExprBody(ctx, expr, expected);
+      return { type, direct: type, inChain: false };
+    }
+  }
+}
+
+function stripNullish(type: Type): { type: Type; removed: boolean } {
+  if (type.kind === "error") return { type, removed: false };
+  const t = unwrap(type);
+  if (t.kind === "prim" && (t.name === "null" || t.name === "undefined")) {
+    return { type: prim("never"), removed: true };
+  }
+  if (t.kind === "union") {
+    const kept: Type[] = [];
+    let removed = false;
+    for (const m of t.members) {
+      const u = unwrap(m);
+      if (u.kind === "prim" && (u.name === "null" || u.name === "undefined")) {
+        removed = true;
+        continue;
+      }
+      kept.push(m);
+    }
+    if (!removed) return { type, removed: false };
+    if (kept.length === 0) return { type: prim("never"), removed: true };
+    if (kept.length === 1) return { type: kept[0] ?? prim("never"), removed: true };
+    return { type: unionType(kept), removed: true };
+  }
+  return { type, removed: false };
 }
 
 function checkExprBody(
@@ -1528,15 +1692,17 @@ function checkExprBody(
     case "ternary":
       return checkTernary(ctx, expr, expected);
     case "call":
-      return checkCall(ctx, expr);
+      return checkCallChain(ctx, expr).type;
     case "member":
-      return checkMember(ctx, expr);
+      return checkMemberChain(ctx, expr).type;
     case "index":
-      return checkIndex(ctx, expr);
+      return checkIndexChain(ctx, expr).type;
     case "new":
       return checkNew(ctx, expr);
     case "arrow":
       return checkArrow(ctx, expr, expected);
+    case "await":
+      return checkAwait(ctx, expr);
     case "assert":
       return checkAssert(ctx, expr);
     default: {
@@ -1758,6 +1924,20 @@ function checkBinary(
     return prim("boolean");
   }
 
+  if (op === "??") {
+    const lt = checkExpr(ctx, expr.left, null);
+    const rt = checkExpr(ctx, expr.right, null);
+    rejectVoidValue(ctx, lt, expr.left.span);
+    rejectVoidValue(ctx, rt, expr.right.span);
+    if (lt.kind === "error") return rt.kind === "error" ? ERROR_TYPE : rt;
+    if (rt.kind === "error") return lt;
+    const stripped = stripNullish(lt);
+    if (!stripped.removed) return lt;
+    if (isNever(stripped.type)) return rt;
+    if (typesEqual(stripped.type, rt)) return stripped.type;
+    return unionType([stripped.type, rt]);
+  }
+
   if (op === "==" || op === "!=" || op === "===" || op === "!==") {
     const lt = checkExpr(ctx, expr.left, null);
     const rt = checkExpr(ctx, expr.right, null);
@@ -1885,6 +2065,21 @@ function checkAssign(
     rejectVoidValue(ctx, valueType, expr.value.span);
     checkAssignability(ctx, valueType, b.valueType, expr.value.span);
     return b.valueType;
+  }
+
+  if (
+    (target.kind === "member" || target.kind === "index") &&
+    invalidOptionalAssignTarget(target)
+  ) {
+    diag(
+      ctx,
+      "jsv.check.invalid_assignment",
+      "An optional chain cannot be assigned to.",
+      target.span,
+      "Close the chain with parentheses before a later property, for example `(obj?.inner).field = value`.",
+    );
+    checkExpr(ctx, expr.value, null);
+    return ERROR_TYPE;
   }
 
   if (target.kind === "member") {
@@ -2043,7 +2238,11 @@ function typesEqual(a: Type, b: Type): boolean {
       if (left.typeParams.length > 0 || right.typeParams.length > 0) return false;
       if (left.params.length !== right.params.length) return false;
       return (
-        left.params.every((p, i) => typesEqual(p.type, right.params[i]!.type)) &&
+        left.params.every(
+          (p, i) =>
+            (p.optional === true) === (right.params[i]!.optional === true) &&
+            typesEqual(p.type, right.params[i]!.type),
+        ) &&
         typesEqual(left.returnType, right.returnType)
       );
     case "ref":
@@ -2138,10 +2337,12 @@ function inferCallTypeArgs(
   argTypes: Type[],
 ): string[] | null {
   if (fn.typeParams.length === 0 || fn.anyArity === true) return null;
-  if (argTypes.length !== fn.params.length) return null;
+  if (argTypes.length < minArity(fn.params) || argTypes.length > fn.params.length) {
+    return null;
+  }
   const solving = new Set(fn.typeParams);
   const env = new Map<string, Type>();
-  for (let i = 0; i < fn.params.length; i++) {
+  for (let i = 0; i < argTypes.length; i++) {
     const param = fn.params[i];
     const arg = argTypes[i];
     if (param === undefined || arg === undefined) return null;
@@ -2178,11 +2379,103 @@ function recordTypeArgHint(
   ctx.typeArgHints.push({ line, column, args });
 }
 
-function checkCall(
+function errorChain(): ChainInfo {
+  return { type: ERROR_TYPE, direct: ERROR_TYPE, inChain: false };
+}
+
+function chainResult(direct: Type, inChain: boolean): ChainInfo {
+  if (direct.kind === "error") return errorChain();
+  return {
+    type: inChain ? optionalReadType(direct) : direct,
+    direct,
+    inChain,
+  };
+}
+
+function checkArguments(
+  ctx: CheckerContext,
+  params: FnParamType[],
+  args: Expr[],
+  anyArity: boolean,
+  span: Span,
+): void {
+  if (anyArity) {
+    for (const a of args) {
+      const t = checkExpr(ctx, a, prim("unknown"));
+      rejectVoidValue(ctx, t, a.span);
+    }
+    return;
+  }
+  const min = minArity(params);
+  const max = params.length;
+  if (args.length < min || args.length > max) {
+    const expected = min === max ? `${max}` : `${min} to ${max}`;
+    diag(
+      ctx,
+      "jsv.check.argument_count",
+      `Expected ${expected} argument(s), got ${args.length}.`,
+      span,
+    );
+  }
+  const n = Math.min(args.length, params.length);
+  for (let i = 0; i < n; i++) {
+    const arg = args[i];
+    const param = params[i];
+    if (arg === undefined || param === undefined) continue;
+    const expected = paramExpected(param);
+    const t = checkExpr(ctx, arg, expected);
+    rejectVoidValue(ctx, t, arg.span);
+    checkAssignability(ctx, t, expected, arg.span);
+  }
+  for (let i = n; i < args.length; i++) {
+    const arg = args[i];
+    if (arg !== undefined) checkExpr(ctx, arg, null);
+  }
+}
+
+function checkAwait(
+  ctx: CheckerContext,
+  expr: Extract<Expr, { kind: "await" }>,
+): Type {
+  if (!ctx.inAsync) {
+    diag(
+      ctx,
+      "jsv.check.await_outside_async",
+      "'await' is only allowed inside an async function.",
+      expr.span,
+      "Mark the enclosing function with `async` and return `Promise<T>`.",
+    );
+  }
+  const argType = checkExpr(ctx, expr.argument, null);
+  const awaited = awaitType(argType);
+  rejectVoidValue(ctx, awaited, expr.span);
+  return awaited;
+}
+
+function invalidOptionalAssignTarget(expr: Expr): boolean {
+  if (expr.kind !== "member" && expr.kind !== "index" && expr.kind !== "call") {
+    return false;
+  }
+  if (expr.stopChain === true || expr.optional) return true;
+  const inner = expr.kind === "call" ? expr.callee : expr.object;
+  if (
+    (inner.kind === "member" ||
+      inner.kind === "index" ||
+      inner.kind === "call") &&
+    inner.stopChain === true
+  ) {
+    return false;
+  }
+  return invalidOptionalAssignTarget(inner);
+}
+
+function checkCallChain(
   ctx: CheckerContext,
   expr: Extract<Expr, { kind: "call" }>,
-): Type {
-  const calleeType = checkExpr(ctx, expr.callee, null);
+): ChainInfo {
+  const calleeInfo = checkChain(ctx, expr.callee, null);
+  const inChain = expr.optional || calleeInfo.inChain;
+  const calleeType = chainCalleeType(calleeInfo, expr.optional);
   const fn = unwrap(calleeType);
 
   if (fn.kind !== "function") {
@@ -2195,7 +2488,7 @@ function checkCall(
       );
     }
     for (const a of expr.args) checkExpr(ctx, a, null);
-    return ERROR_TYPE;
+    return errorChain();
   }
 
   const subst = new Map<string, Type>();
@@ -2215,7 +2508,7 @@ function checkCall(
         expr.callee.span.start.column,
         inferCallTypeArgs(fn, argTypes),
       );
-      return ERROR_TYPE;
+      return errorChain();
     }
     if (expr.typeArgs.length !== fn.typeParams.length) {
       diag(
@@ -2225,7 +2518,7 @@ function checkCall(
         expr.span,
       );
       for (const a of expr.args) checkExpr(ctx, a, null);
-      return ERROR_TYPE;
+      return errorChain();
     }
     const args = expr.typeArgs.map((t) => resolveTypeNode(ctx, t));
     for (let i = 0; i < fn.typeParams.length; i++) {
@@ -2242,42 +2535,17 @@ function checkCall(
     );
   }
 
-  const params = fn.params.map((p) => ({
-    name: p.name,
-    type: substitute(p.type, subst),
-  }));
+  const params = fn.params.map((p) => {
+    const next: FnParamType = {
+      name: p.name,
+      type: substitute(p.type, subst),
+    };
+    if (p.optional === true) next.optional = true;
+    return next;
+  });
   const returnType = substitute(fn.returnType, subst);
-
-  if (fn.anyArity === true) {
-    for (const a of expr.args) {
-      const t = checkExpr(ctx, a, prim("unknown"));
-      rejectVoidValue(ctx, t, a.span);
-    }
-    return returnType;
-  }
-
-  if (expr.args.length !== params.length) {
-    diag(
-      ctx,
-      "jsv.check.argument_count",
-      `Expected ${params.length} argument(s), got ${expr.args.length}.`,
-      expr.span,
-    );
-  }
-  const n = Math.min(expr.args.length, params.length);
-  for (let i = 0; i < n; i++) {
-    const arg = expr.args[i];
-    const param = params[i];
-    if (arg === undefined || param === undefined) continue;
-    const t = checkExpr(ctx, arg, param.type);
-    rejectVoidValue(ctx, t, arg.span);
-    checkAssignability(ctx, t, param.type, arg.span);
-  }
-  for (let i = n; i < expr.args.length; i++) {
-    const arg = expr.args[i];
-    if (arg !== undefined) checkExpr(ctx, arg, null);
-  }
-  return returnType;
+  checkArguments(ctx, params, expr.args, fn.anyArity === true, expr.span);
+  return chainResult(returnType, inChain);
 }
 
 function memberCursor(
@@ -2313,46 +2581,53 @@ function noteMember(
   }
 }
 
-function checkMember(
+function checkMemberChain(
   ctx: CheckerContext,
   expr: Extract<Expr, { kind: "member" }>,
-): Type {
-  const objType = checkExpr(ctx, expr.object, null);
-  noteMember(ctx, expr, objType);
-  const prop = getProperty(objType, expr.property);
+): ChainInfo {
+  const objInfo = checkChain(ctx, expr.object, null);
+  const inChain = expr.optional || objInfo.inChain;
+  const base = inChain ? stripNullish(objInfo.direct).type : objInfo.type;
+  noteMember(ctx, expr, base);
+  const prop = getProperty(base, expr.property);
   if (prop === null) {
-    if (objType.kind === "error") return ERROR_TYPE;
-    const known = propertyNames(objType);
+    if (base.kind === "error" || objInfo.type.kind === "error") return errorChain();
+    const shown = isNever(base) ? objInfo.type : base;
+    const known = propertyNames(shown);
     diag(
       ctx,
       "jsv.check.missing_property",
-      `Property '${expr.property}' does not exist on type '${typeToString(objType)}'.`,
+      `Property '${expr.property}' does not exist on type '${typeToString(shown)}'.`,
       expr.propertySpan,
       known.length > 0 ? `Known properties: ${known.join(", ")}` : undefined,
     );
-    return ERROR_TYPE;
+    return errorChain();
   }
-  return prop.optional ? optionalReadType(prop.type) : prop.type;
+  const direct = prop.optional ? optionalReadType(prop.type) : prop.type;
+  return chainResult(direct, inChain);
 }
 
-function checkIndex(
+function checkIndexChain(
   ctx: CheckerContext,
   expr: Extract<Expr, { kind: "index" }>,
-): Type {
-  const objType = checkExpr(ctx, expr.object, null);
+): ChainInfo {
+  const objInfo = checkChain(ctx, expr.object, null);
+  const inChain = expr.optional || objInfo.inChain;
+  const base = inChain ? stripNullish(objInfo.direct).type : objInfo.type;
   const indexType = checkExpr(ctx, expr.index, prim("number"));
   rejectVoidValue(ctx, indexType, expr.index.span);
-  const expanded = unwrap(objType);
+  const expanded = unwrap(base);
   if (expanded.kind !== "array") {
-    if (objType.kind !== "error") {
+    if (base.kind !== "error" && objInfo.type.kind !== "error") {
+      const shown = isNever(base) ? objInfo.type : base;
       diag(
         ctx,
         "jsv.check.not_indexable",
-        `Type '${typeToString(objType)}' is not indexable.`,
+        `Type '${typeToString(shown)}' is not indexable.`,
         expr.object.span,
       );
     }
-    return ERROR_TYPE;
+    return errorChain();
   }
   if (
     indexType.kind !== "error" &&
@@ -2365,7 +2640,7 @@ function checkIndex(
       expr.index.span,
     );
   }
-  return expanded.element;
+  return chainResult(expanded.element, inChain);
 }
 
 function checkNew(
@@ -2416,27 +2691,7 @@ function checkNew(
     const ctor = b.valueType;
     const instance = refType(b.typeDef);
     if (ctor.kind === "function") {
-      if (expr.args.length !== ctor.params.length) {
-        diag(
-          ctx,
-          "jsv.check.argument_count",
-          `Expected ${ctor.params.length} argument(s), got ${expr.args.length}.`,
-          expr.span,
-        );
-      }
-      const n = Math.min(expr.args.length, ctor.params.length);
-      for (let i = 0; i < n; i++) {
-        const arg = expr.args[i];
-        const param = ctor.params[i];
-        if (arg === undefined || param === undefined) continue;
-        const t = checkExpr(ctx, arg, param.type);
-        rejectVoidValue(ctx, t, arg.span);
-        checkAssignability(ctx, t, param.type, arg.span);
-      }
-      for (let i = n; i < expr.args.length; i++) {
-        const arg = expr.args[i];
-        if (arg !== undefined) checkExpr(ctx, arg, null);
-      }
+      checkArguments(ctx, ctor.params, expr.args, false, expr.span);
     }
     return instance;
   }
@@ -2462,11 +2717,15 @@ function checkArrow(
 
   pushScope(ctx);
   const prevThis = ctx.thisType;
+  const prevAsyncFn = ctx.asyncFn;
+  const prevInAsync = ctx.inAsync;
   ctx.thisType = null;
+  ctx.inAsync = expr.async;
 
   const params: FnParamType[] = [];
   for (const p of expr.params) {
-    const pType = resolveTypeNode(ctx, p.type);
+    const declared = resolveTypeNode(ctx, p.type);
+    const valueType = p.optional ? optionalReadType(declared) : declared;
     declareInScope(
       ctx,
       {
@@ -2474,26 +2733,46 @@ function checkArrow(
         kind: "value",
         origin: "param",
         mutable: true,
-        valueType: pType,
+        valueType,
       },
       p.nameSpan,
     );
-    params.push({ name: p.name, type: pType });
+    const param: FnParamType = { name: p.name, type: declared };
+    if (p.optional) param.optional = true;
+    params.push(param);
   }
   captureScope(ctx, expr.span);
 
   let returnType: Type;
   if (expr.body.kind === "block") {
-    const declaredRet = expectedFn?.returnType ?? prim("void");
+    const annotated = expectedFn?.returnType ?? prim("void");
+    let declaredRet = annotated;
     const prevRet = ctx.returnType;
+    if (expr.async) {
+      ctx.asyncFn = true;
+      declaredRet =
+        expectedFn !== null
+          ? asyncReturnInner(ctx, annotated, expr.span)
+          : prim("void");
+    } else {
+      ctx.asyncFn = false;
+    }
     ctx.returnType = declaredRet;
     const definitelyReturns = checkBlock(ctx, expr.body);
     ctx.returnType = prevRet;
-    returnType = expectedFn !== null ? declaredRet : prim("void");
+    if (expr.async) {
+      returnType =
+        expectedFn !== null && declaredRet.kind !== "error"
+          ? annotated
+          : promiseType(prim("void"));
+    } else {
+      returnType = expectedFn !== null ? declaredRet : prim("void");
+    }
+    const missingAgainst = expr.async ? declaredRet : returnType;
     if (
       expectedFn !== null &&
-      !isVoid(declaredRet) &&
-      !isNever(declaredRet) &&
+      !isVoid(missingAgainst) &&
+      !isNever(missingAgainst) &&
       !definitelyReturns
     ) {
       diag(
@@ -2504,16 +2783,48 @@ function checkArrow(
       );
     }
   } else {
-    const expectedRet = expectedFn?.returnType ?? null;
-    returnType = checkExpr(ctx, expr.body, expectedRet);
-    rejectVoidValue(ctx, returnType, expr.body.span);
-    if (expectedRet !== null) {
-      checkAssignability(ctx, returnType, expectedRet, expr.body.span);
-      returnType = expectedRet;
+    const annotated = expectedFn?.returnType ?? null;
+    let expectedRet = annotated;
+    if (expr.async) {
+      ctx.asyncFn = true;
+      expectedRet =
+        annotated !== null ? asyncReturnInner(ctx, annotated, expr.span) : null;
+    } else {
+      ctx.asyncFn = false;
+    }
+    const bodyType = checkExpr(ctx, expr.body, expectedRet);
+    rejectVoidValue(ctx, bodyType, expr.body.span);
+    if (expr.async) {
+      if (expectedRet !== null && expectedRet.kind !== "error" && bodyType.kind !== "error") {
+        const wrapped = promiseType(expectedRet);
+        if (
+          !isAssignable(bodyType, expectedRet) &&
+          !isAssignable(bodyType, wrapped)
+        ) {
+          diag(
+            ctx,
+            "jsv.check.not_assignable",
+            `Type '${typeToString(bodyType)}' is not assignable to type '${typeToString(expectedRet)}' or '${typeToString(wrapped)}'.`,
+            expr.body.span,
+          );
+        }
+      }
+      returnType =
+        annotated !== null && expectedRet !== null && expectedRet.kind !== "error"
+          ? annotated
+          : promiseType(awaitType(bodyType));
+    } else {
+      returnType = bodyType;
+      if (expectedRet !== null) {
+        checkAssignability(ctx, returnType, expectedRet, expr.body.span);
+        returnType = expectedRet;
+      }
     }
   }
 
   ctx.thisType = prevThis;
+  ctx.asyncFn = prevAsyncFn;
+  ctx.inAsync = prevInAsync;
   popScope(ctx);
   return functionType(params, returnType);
 }

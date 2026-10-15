@@ -78,11 +78,14 @@ const PREC_CMP = 50;
 const PREC_EQ = 40;
 const PREC_AND = 30;
 const PREC_OR = 20;
+const PREC_NULLISH = 15;
 const PREC_TERNARY = 10;
 const PREC_ASSIGN = 5;
 
 function binaryPrec(op: string): number {
   switch (op) {
+    case "??":
+      return PREC_NULLISH;
     case "||":
       return PREC_OR;
     case "&&":
@@ -119,6 +122,7 @@ function exprPrec(expr: Expr): number {
     case "binary":
       return binaryPrec(expr.op);
     case "unary":
+    case "await":
       return PREC_UNARY;
     case "assert":
       return exprPrec(expr.expression);
@@ -190,6 +194,40 @@ function emitBlock(block: Block, options: EmitOptions): string {
   return `{\n${lines.join("\n")}\n}`;
 }
 
+function mixesNullish(op: string, child: Expr): boolean {
+  if (child.kind !== "binary") return false;
+  const childNullish = child.op === "??";
+  const parentNullish = op === "??";
+  const childLogical = child.op === "||" || child.op === "&&";
+  const parentLogical = op === "||" || op === "&&";
+  return (parentNullish && childLogical) || (parentLogical && childNullish);
+}
+
+function emitBinaryOperand(
+  child: Expr,
+  options: EmitOptions,
+  minPrec: number,
+  parentOp: string,
+): string {
+  const rendered = emitExpr(child, options, minPrec);
+  if (mixesNullish(parentOp, child) && exprPrec(child) >= minPrec) {
+    return `(${rendered})`;
+  }
+  return rendered;
+}
+
+/** Parentheses are required when a later postfix sits outside a closed optional chain. */
+function emitPostfixObject(expr: Expr, options: EmitOptions): string {
+  const rendered = emitExpr(expr, options, PREC_POSTFIX);
+  if (
+    (expr.kind === "member" || expr.kind === "index" || expr.kind === "call") &&
+    expr.stopChain === true
+  ) {
+    return `(${rendered})`;
+  }
+  return rendered;
+}
+
 function emitExpr(expr: Expr, options: EmitOptions, minPrec = 0): string {
   if (expr.kind === "assert") {
     return emitExpr(expr.expression, options, minPrec);
@@ -247,8 +285,8 @@ function emitExprRaw(expr: Expr, options: EmitOptions): string {
     }
     case "binary": {
       const p = binaryPrec(expr.op);
-      const left = emitExpr(expr.left, options, p);
-      const right = emitExpr(expr.right, options, p + 1);
+      const left = emitBinaryOperand(expr.left, options, p, expr.op);
+      const right = emitBinaryOperand(expr.right, options, p + 1, expr.op);
       return `${left} ${expr.op} ${right}`;
     }
     case "assign": {
@@ -263,17 +301,24 @@ function emitExprRaw(expr: Expr, options: EmitOptions): string {
       return `${test} ? ${consequent} : ${alternate}`;
     }
     case "call": {
-      const callee = emitExpr(expr.callee, options, PREC_POSTFIX);
+      const callee = emitPostfixObject(expr.callee, options);
       const args = expr.args.map((a) => emitExpr(a, options)).join(", ");
-      return `${callee}(${args})`;
+      const op = expr.optional ? "?." : "";
+      return `${callee}${op}(${args})`;
     }
     case "member": {
-      const object = emitExpr(expr.object, options, PREC_POSTFIX);
-      return `${object}.${expr.property}`;
+      const object = emitPostfixObject(expr.object, options);
+      const op = expr.optional ? "?." : ".";
+      return `${object}${op}${expr.property}`;
     }
     case "index": {
-      const object = emitExpr(expr.object, options, PREC_POSTFIX);
-      return `${object}[${emitExpr(expr.index, options)}]`;
+      const object = emitPostfixObject(expr.object, options);
+      const op = expr.optional ? "?." : "";
+      return `${object}${op}[${emitExpr(expr.index, options)}]`;
+    }
+    case "await": {
+      const argument = emitExpr(expr.argument, options, PREC_UNARY + 1);
+      return `await ${argument}`;
     }
     case "new": {
       const callee = emitExpr(expr.callee, options, PREC_POSTFIX);
@@ -284,10 +329,11 @@ function emitExprRaw(expr: Expr, options: EmitOptions): string {
       const params = emitParams(expr.params);
       const paramList =
         expr.params.length === 1 ? params : `(${params})`;
+      const asyncKw = expr.async ? "async " : "";
       if (expr.body.kind === "block") {
-        return `${paramList} => ${emitBlock(expr.body, options)}`;
+        return `${asyncKw}${paramList} => ${emitBlock(expr.body, options)}`;
       }
-      return `${paramList} => ${emitExpr(expr.body, options, PREC_ASSIGN)}`;
+      return `${asyncKw}${paramList} => ${emitExpr(expr.body, options, PREC_ASSIGN)}`;
     }
     case "assert":
       return emitExprRaw(expr.expression, options);
@@ -324,7 +370,8 @@ function emitFunction(stmt: FunctionDecl, ctx: EmitCtx): string {
       ? "export "
       : "";
   const params = emitParams(stmt.params);
-  return `${prefix}function ${stmt.name}(${params}) ${emitBlock(stmt.body, ctx.options)}`;
+  const asyncKw = stmt.async ? "async " : "";
+  return `${prefix}${asyncKw}function ${stmt.name}(${params}) ${emitBlock(stmt.body, ctx.options)}`;
 }
 
 function emitClass(stmt: ClassDecl, ctx: EmitCtx): string {
@@ -342,8 +389,9 @@ function emitClass(stmt: ClassDecl, ctx: EmitCtx): string {
         `constructor(${emitParams(m.params)}) ${emitBlock(m.body, ctx.options)}`,
       );
     } else {
+      const asyncKw = m.async ? "async " : "";
       parts.push(
-        `${m.name}(${emitParams(m.params)}) ${emitBlock(m.body, ctx.options)}`,
+        `${asyncKw}${m.name}(${emitParams(m.params)}) ${emitBlock(m.body, ctx.options)}`,
       );
     }
   }

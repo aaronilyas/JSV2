@@ -20,6 +20,8 @@ export type TokenKind =
   | ";"
   | ":"
   | "?"
+  | "?."
+  | "??"
   | "."
   | "=>"
   | "="
@@ -81,6 +83,8 @@ export const KEYWORDS = new Set([
   "as",
   "new",
   "typeof",
+  "async",
+  "await",
 ]);
 
 type BraceFrame = "block" | "template";
@@ -500,6 +504,13 @@ function emitPunct(state: LexerState): boolean {
   const start = pos(state);
   const two = ch + peek(state, 1);
   const three = two + peek(state, 2);
+
+  if (two === "??" || two === "?.") {
+    advance(state);
+    advance(state);
+    pushToken(state, two, two, start, lastCharPos(state));
+    return true;
+  }
 
   if (three === "===" || three === "!==") {
     advance(state);

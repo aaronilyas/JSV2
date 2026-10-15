@@ -9,7 +9,28 @@ export type PropType = {
 export type FnParamType = {
   name: string;
   type: Type;
+  /** Callers may omit this argument. The binding type includes `undefined`. */
+  optional?: boolean;
 };
+
+/**
+ * Ambient `Promise<T>`. Identity is the def object, so user aliases named
+ * `Promise` do not get Promise assignability or `await` unwrapping.
+ * The body is never expanded: `await` and assignability read `args` directly.
+ */
+export const PROMISE_DEF: TypeDef = {
+  name: "Promise",
+  typeParams: ["T"],
+  body: { kind: "object", props: [] },
+};
+
+export function promiseType(inner: Type): Type {
+  return refType(PROMISE_DEF, [inner]);
+}
+
+export function isPromise(type: Type): boolean {
+  return type.kind === "ref" && type.def === PROMISE_DEF;
+}
 
 /** Shared mutable definition for aliases, interfaces, and class instance types. */
 export type TypeDef = {
@@ -102,10 +123,7 @@ export function typeToString(type: Type, seen?: Set<TypeDef>): string {
       const parts = type.props.map((p) => {
         if (p.type.kind === "function" && p.type.typeParams.length === 0) {
           const params = p.type.params
-            .map(
-              (param) =>
-                `${param.name}: ${typeToString(param.type, visiting)}`,
-            )
+            .map((param) => formatParam(param, visiting))
             .join(", ");
           return `${p.name}${p.optional ? "?" : ""}: (${params}) => ${typeToString(p.type.returnType, visiting)}`;
         }
@@ -117,7 +135,7 @@ export function typeToString(type: Type, seen?: Set<TypeDef>): string {
       const tparams =
         type.typeParams.length > 0 ? `<${type.typeParams.join(", ")}>` : "";
       const params = type.params
-        .map((p) => `${p.name}: ${typeToString(p.type, visiting)}`)
+        .map((p) => formatParam(p, visiting))
         .join(", ");
       return `${tparams}(${params}) => ${typeToString(type.returnType, visiting)}`;
     }
@@ -136,6 +154,10 @@ export function typeToString(type: Type, seen?: Set<TypeDef>): string {
       return _exhaustive;
     }
   }
+}
+
+function formatParam(p: FnParamType, visiting: Set<TypeDef>): string {
+  return `${p.name}${p.optional ? "?" : ""}: ${typeToString(p.type, visiting)}`;
 }
 
 export function expand(type: Type): Type {
@@ -171,10 +193,14 @@ export function substitute(type: Type, subst: Map<string, Type>): Type {
       const inner = new Map(subst);
       for (const tp of type.typeParams) inner.delete(tp);
       return functionType(
-        type.params.map((p) => ({
-          name: p.name,
-          type: substitute(p.type, inner),
-        })),
+        type.params.map((p) => {
+          const next: FnParamType = {
+            name: p.name,
+            type: substitute(p.type, inner),
+          };
+          if (p.optional === true) next.optional = true;
+          return next;
+        }),
         substitute(type.returnType, inner),
         type.typeParams,
         type.anyArity === true,
@@ -198,11 +224,32 @@ export function unwrap(type: Type, seen?: Set<TypeDef>): Type {
   const visiting = seen ?? new Set<TypeDef>();
   let t = type;
   while (t.kind === "ref") {
+    if (t.def === PROMISE_DEF) return t;
     if (visiting.has(t.def)) return t;
     visiting.add(t.def);
     t = expand(t);
   }
   return t;
+}
+
+/** Resolved type of `await` on `type`. Non-promises pass through. Nested `Promise`s unwrap. */
+export function awaitType(type: Type, depth = 0): Type {
+  if (type.kind === "error" || depth > 20) return type;
+  const t = unwrap(type);
+  if (t.kind === "ref" && t.def === PROMISE_DEF) {
+    return awaitType(t.args[0] ?? ERROR_TYPE, depth + 1);
+  }
+  if (t.kind === "union") {
+    return unionType(t.members.map((m) => awaitType(m, depth + 1)));
+  }
+  return type;
+}
+
+/** `T` when `type` is `Promise<T>` (aliases unwrapped). Otherwise null. */
+export function promiseInner(type: Type): Type | null {
+  const t = unwrap(type);
+  if (t.kind !== "ref" || t.def !== PROMISE_DEF) return null;
+  return t.args[0] ?? null;
 }
 
 export function isNever(type: Type): boolean {
@@ -293,13 +340,31 @@ export function isAssignable(
   if (isUnknown(target)) return true;
   if (isUnknown(source)) return isUnknown(target);
 
-  // Expand refs before structural compare (guards via seen).
+  // Expand aliases. Promise stays nominal so Promise<T> is not `{}`.
   if (source.kind === "ref" || target.kind === "ref") {
-    return isAssignable(
-      source.kind === "ref" ? expand(source) : source,
-      target.kind === "ref" ? expand(target) : target,
-      seen,
-    );
+    const s =
+      source.kind === "ref" && source.def !== PROMISE_DEF
+        ? expand(source)
+        : source;
+    const t =
+      target.kind === "ref" && target.def !== PROMISE_DEF
+        ? expand(target)
+        : target;
+    if (
+      (s.kind === "ref" && s.def === PROMISE_DEF) ||
+      (t.kind === "ref" && t.def === PROMISE_DEF)
+    ) {
+      if (
+        s.kind === "ref" &&
+        t.kind === "ref" &&
+        s.def === PROMISE_DEF &&
+        t.def === PROMISE_DEF
+      ) {
+        return isAssignable(s.args[0] ?? ERROR_TYPE, t.args[0] ?? ERROR_TYPE, seen);
+      }
+      return false;
+    }
+    return isAssignable(s, t, seen);
   }
 
   // Source unions first so U is assignable to U (and to any target that
@@ -336,7 +401,11 @@ export function isAssignable(
       const tp = target.params[i];
       const sp = source.params[i];
       if (tp === undefined || sp === undefined) return false;
-      if (!isAssignable(tp.type, sp.type, seen)) return false;
+      // A target optional parameter may be omitted, so the source must accept that.
+      if (tp.optional === true && sp.optional !== true) return false;
+      const tpType = tp.optional === true ? optionalReadType(tp.type) : tp.type;
+      const spType = sp.optional === true ? optionalReadType(sp.type) : sp.type;
+      if (!isAssignable(tpType, spType, seen)) return false;
     }
     return isAssignable(source.returnType, target.returnType, seen);
   }
@@ -367,6 +436,17 @@ export function typesOverlap(a: Type, b: Type, visited?: VisitSet): boolean {
   if (seen.has(key)) return true;
   seen.add(key);
 
+  if (a.kind === "ref" && a.def === PROMISE_DEF) {
+    if (b.kind === "ref" && b.def === PROMISE_DEF) {
+      return typesOverlap(a.args[0] ?? ERROR_TYPE, b.args[0] ?? ERROR_TYPE, seen);
+    }
+    if (b.kind === "ref") return typesOverlap(a, expand(b), seen);
+    return false;
+  }
+  if (b.kind === "ref" && b.def === PROMISE_DEF) {
+    if (a.kind === "ref") return typesOverlap(expand(a), b, seen);
+    return false;
+  }
   if (a.kind === "ref") return typesOverlap(expand(a), b, seen);
   if (b.kind === "ref") return typesOverlap(a, expand(b), seen);
 

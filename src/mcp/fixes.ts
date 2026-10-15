@@ -307,6 +307,7 @@ function findUse(program: Program, line: number, column: number): NameUse | null
         for (const p of expr.properties) walkExpr(p.value);
         return;
       case "unary":
+      case "await":
         walkExpr(expr.argument);
         return;
       case "binary":
