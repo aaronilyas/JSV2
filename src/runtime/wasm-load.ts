@@ -3,6 +3,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
+export type NodeStats = {
+  live: number;
+  capacity: number;
+  free: number;
+};
+
+export type PendingResult = {
+  threw: boolean;
+  error: unknown;
+};
+
 export type JsvRuntime = {
   backend(): string;
   signalNew(initial: unknown): number;
@@ -12,6 +23,9 @@ export type JsvRuntime = {
   computedGet(id: number): unknown;
   effectNew(fn: () => unknown): number;
   effectDispose(id: number): void;
+  releaseNode(id: number): void;
+  nodeStats(): NodeStats;
+  takePending(): PendingResult;
   reconcile(
     prev: string[],
     next: string[],
@@ -78,7 +92,10 @@ export function ensureWasm(): Promise<void> {
     // Do not await: go.run resolves only when the Go program exits.
     void go.run(result.instance);
     await ready;
-  })();
+  })().catch((err: unknown) => {
+    loadPromise = null;
+    throw err;
+  });
   return loadPromise;
 }
 
@@ -88,4 +105,16 @@ export function jsvRuntime(): JsvRuntime {
 
 export function runtimeBackend(): "wasm" {
   return getRuntime().backend() as "wasm";
+}
+
+export function nodeStats(): NodeStats {
+  return getRuntime().nodeStats();
+}
+
+/** Rethrow a user callback error captured by the WASM graph, if any. */
+export function throwIfPending(): void {
+  const pending = getRuntime().takePending();
+  if (pending.threw) {
+    throw pending.error;
+  }
 }
