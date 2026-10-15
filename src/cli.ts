@@ -7,6 +7,7 @@ import {
   diagnosticsResult,
   formatDiagnosticsText,
 } from "./diagnostics.ts";
+import { parse } from "./parser/parse.ts";
 
 const packageDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -21,7 +22,7 @@ const USAGE = `Usage: jsv <command> [options]
 Commands:
   version              Print the jsv2 package version
   help                 Show this help
-  check <file.jsv>     Type-check a JSV2 source file
+  check <file.jsv>     Parse a JSV2 source file
   run <file.jsv>       Run a JSV2 source file
 
 Options:
@@ -108,17 +109,24 @@ function handleFileCommand(
     return 1;
   }
 
-  emitDiagnostics(
-    [
-      errorDiagnostic(
-        "jsv.not_implemented",
-        `${command} is not implemented yet: the parser is not implemented`,
-        filePath,
-      ),
-    ],
-    format,
-  );
-  return 2;
+  if (command === "run") {
+    emitDiagnostics(
+      [
+        errorDiagnostic(
+          "jsv.not_implemented",
+          "run is not implemented yet",
+          filePath,
+        ),
+      ],
+      format,
+    );
+    return 2;
+  }
+
+  const source = readFileSync(filePath, "utf8");
+  const { diagnostics } = parse(source, filePath);
+  emitDiagnostics(diagnostics, format);
+  return diagnostics.length > 0 ? 1 : 0;
 }
 
 export function main(argv: readonly string[]): number {

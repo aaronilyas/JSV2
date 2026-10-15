@@ -84,17 +84,73 @@ test("bad extension yields jsv.bad_extension", () => {
   }
 });
 
-test("existing .jsv yields jsv.not_implemented with exit 2", () => {
+test("check of comment-only .jsv parses and exits 0", () => {
   const dir = mkdtempSync(join(tmpdir(), "jsv2-"));
   try {
     const file = join(dir, "sample.jsv");
     writeFileSync(file, "// placeholder\n");
-    for (const command of ["check", "run"] as const) {
-      const result = runCli([command, file]);
-      assert.equal(result.status, 2);
-      assert.match(result.stdout, /jsv\.not_implemented/);
-      assert.match(result.stdout, new RegExp(command));
-    }
+    const result = runCli(["check", file]);
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("check --format json success is ok with empty diagnostics", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jsv2-"));
+  try {
+    const file = join(dir, "sample.jsv");
+    writeFileSync(file, "// ok\n");
+    const result = runCli(["check", "--format", "json", file]);
+    assert.equal(result.status, 0);
+    const parsed = JSON.parse(result.stdout) as {
+      ok: boolean;
+      diagnostics: unknown[];
+    };
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.diagnostics, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("run of existing .jsv yields jsv.not_implemented with exit 2", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jsv2-"));
+  try {
+    const file = join(dir, "sample.jsv");
+    writeFileSync(file, "// placeholder\n");
+    const result = runCli(["run", file]);
+    assert.equal(result.status, 2);
+    assert.match(result.stdout, /jsv\.not_implemented/);
+    assert.match(result.stdout, /run/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("check syntax error exits 1 with jsv.parse.* and 1-based span", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jsv2-"));
+  try {
+    const file = join(dir, "bad.jsv");
+    writeFileSync(file, "let x = ;\n");
+    const result = runCli(["check", "--format", "json", file]);
+    assert.equal(result.status, 1);
+    const parsed = JSON.parse(result.stdout) as {
+      ok: boolean;
+      diagnostics: Array<{
+        code: string;
+        start?: { line: number; column: number };
+      }>;
+    };
+    assert.equal(parsed.ok, false);
+    const d = parsed.diagnostics[0];
+    assert.ok(d);
+    assert.match(d.code, /^jsv\.parse\./);
+    assert.equal(typeof d.start?.line, "number");
+    assert.equal(typeof d.start?.column, "number");
+    assert.ok((d.start?.line ?? 0) >= 1);
+    assert.ok((d.start?.column ?? 0) >= 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
