@@ -1,5 +1,6 @@
 import { effect, signal, type Computed, type Signal } from "./graph.ts";
 import { reconcile, type KeyedEntry } from "./reconcile.ts";
+import { jsvRuntime } from "./wasm-load.ts";
 
 export type Node = {
   readonly nodeKind: "text" | "element" | "fragment" | "list";
@@ -151,11 +152,7 @@ export function list<T>(
 }
 
 function escapeXml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+  return jsvRuntime().escapeXml(s);
 }
 
 function serializeProps(props: DomProps): string {

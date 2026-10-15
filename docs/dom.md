@@ -44,4 +44,4 @@ renderToString(node: Node): string
 - Signal/computed props update that attribute only (`setAttribute`).
 - `list` reconciles by key: same key keeps the DOM node and `set`s the row item signal; new keys mount; missing keys unmount; order follows the array via `insertBefore`.
 
-The signal graph (`src/runtime/graph.ts`) and keyed diff (`src/runtime/reconcile.ts`) are the hot paths reserved for a later WASM port.
+The signal graph, keyed list diff, and XML escape run in a Go WASM module (`runtime/go/` → `runtime/wasm/jsv.wasm`), loaded once by JS. DOM node creation, event listeners, and `insertBefore` stay in JS; `mount` applies patches in JS.

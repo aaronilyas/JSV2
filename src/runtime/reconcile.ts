@@ -1,3 +1,7 @@
+import { ensureWasm, jsvRuntime } from "./wasm-load.ts";
+
+await ensureWasm();
+
 export type KeyedEntry<T> = {
   key: string;
   item: T;
@@ -19,26 +23,25 @@ export function reconcile<T>(
   nextItems: readonly T[],
   keyOf: (item: T) => string,
 ): ReconcileResult<T> {
-  const prevByKey = new Map<string, KeyedEntry<T>>();
-  for (const entry of prevEntries) {
-    prevByKey.set(entry.key, entry);
-  }
+  const prevKeys = prevEntries.map((e) => e.key);
+  const nextKeys = nextItems.map(keyOf);
+  const { reuse, removed: removedIdx } = jsvRuntime().reconcile(
+    prevKeys,
+    nextKeys,
+  );
 
   const next: ReconcileResult<T>["next"] = [];
-  const seen = new Set<string>();
-
-  for (const item of nextItems) {
-    const key = keyOf(item);
-    seen.add(key);
-    const prev = prevByKey.get(key) ?? null;
+  for (let i = 0; i < nextItems.length; i++) {
+    const key = nextKeys[i]!;
+    const item = nextItems[i]!;
+    const prevIdx = reuse[i]!;
+    const prev = prevIdx >= 0 ? (prevEntries[prevIdx] ?? null) : null;
     next.push({ key, item, prev });
   }
 
   const removed: KeyedEntry<T>[] = [];
-  for (const entry of prevEntries) {
-    if (!seen.has(entry.key)) {
-      removed.push(entry);
-    }
+  for (const idx of removedIdx) {
+    removed.push(prevEntries[idx]!);
   }
 
   return { next, removed };

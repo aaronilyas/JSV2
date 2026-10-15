@@ -1,10 +1,11 @@
 # JSV2
 
-JSV2 is a constrained TypeScript-like language aimed at agentic coding. It includes a fine-grained DOM/reactivity runtime so React is not used for ordinary UI, plus a hand-written lexer/parser, type checker, TypeScript build/check tooling, and a CLI (`jsv`). A hot Go/WASM port of the graph and keyed diff, and an MCP server, are planned but not implemented yet.
+JSV2 is a constrained TypeScript-like language aimed at agentic coding. It includes a fine-grained DOM/reactivity runtime so React is not used for ordinary UI, plus a hand-written lexer/parser, type checker, TypeScript build/check tooling, and a CLI (`jsv`). The signal graph, keyed list diff, and XML escape run in a Go/WASM module loaded once by JS. An MCP server is planned but not implemented yet.
 
 ## Requirements
 
 - Node.js v23.5.0+ (CLI runs with `node --experimental-strip-types`)
+- Go 1.22+ (for `make wasm` / `make test`)
 
 ## Setup
 
@@ -17,10 +18,11 @@ npm install
 | Target | What it does |
 |--------|----------------|
 | `make check` | `tsc --noEmit` (strict typecheck) |
-| `make test` | `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, `tests/checker/*.ts`, and `tests/runtime/*.ts` |
+| `make wasm` | Build `runtime/wasm/jsv.wasm` and copy `wasm_exec.js` |
+| `make test` | `make wasm`, Go unit tests, then `node --experimental-strip-types --test` on `tests/*.ts`, `tests/parser/*.ts`, `tests/checker/*.ts`, and `tests/runtime/*.ts` |
 | `make build` | Compile TypeScript to `dist/` with `tsc` |
 
-`make build` assumes dependencies are already installed.
+`make build` assumes dependencies are already installed. `make test` builds the WASM module first.
 
 ## CLI (`jsv`)
 

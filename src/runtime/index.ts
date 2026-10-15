@@ -2,6 +2,7 @@ export {
   signal,
   computed,
   effect,
+  runtimeBackend,
   type Signal,
   type Computed,
 } from "./graph.ts";
