@@ -214,11 +214,44 @@ function walkExpr(expr: Expr, state: WalkState): void {
     case "call":
       walkCall(expr, state);
       return;
+    case "jsx":
+      for (const attr of expr.attributes) walkExpr(attr.value, state);
+      if (expr.tag === "each") {
+        state.lists.push(expr.span);
+        checkEachUnused(expr, state);
+      }
+      for (const child of expr.children) {
+        if (child.kind === "expr") walkExpr(child.expr, state);
+      }
+      return;
     default: {
       const _exhaustive: never = expr;
       return _exhaustive;
     }
   }
+}
+
+function checkEachUnused(
+  expr: Extract<Expr, { kind: "jsx" }>,
+  state: WalkState,
+): void {
+  const render = expr.children.find(
+    (c) => c.kind === "expr" && c.expr.kind === "arrow",
+  );
+  if (render === undefined || render.kind !== "expr" || render.expr.kind !== "arrow") {
+    return;
+  }
+  const first = render.expr.params[0];
+  if (first === undefined) return;
+  if (identReferenced(render.expr.body, first.name)) return;
+  state.issues.push({
+    code: "jsv.dom.list_unused_item",
+    severity: "warning",
+    message: `List render parameter '${first.name}' is never referenced.`,
+    file: state.file,
+    start: expr.span.start,
+    end: expr.span.end,
+  });
 }
 
 function walkCall(
@@ -434,6 +467,14 @@ function collectSignalAccesses(
       for (const a of expr.args) collectSignalAccesses(a, reads, writes);
       return;
     }
+    case "jsx":
+      for (const attr of expr.attributes) {
+        collectSignalAccesses(attr.value, reads, writes);
+      }
+      for (const child of expr.children) {
+        if (child.kind === "expr") collectSignalAccesses(child.expr, reads, writes);
+      }
+      return;
     default: {
       const _exhaustive: never = expr;
       return _exhaustive;
@@ -570,6 +611,13 @@ function identReferenced(node: Expr | Block | Statement, name: string): boolean 
       return (
         identReferenced(expr.callee, name) ||
         expr.args.some((a) => identReferenced(a, name))
+      );
+    case "jsx":
+      return (
+        expr.attributes.some((attr) => identReferenced(attr.value, name)) ||
+        expr.children.some(
+          (child) => child.kind === "expr" && identReferenced(child.expr, name),
+        )
       );
     default: {
       const _exhaustive: never = expr;

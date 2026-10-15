@@ -9,6 +9,8 @@ import type {
   IfStmt,
   ImportStmt,
   InterfaceDecl,
+  JsxAttribute,
+  JsxChild,
   Param,
   Program,
   ReturnStmt,
@@ -22,7 +24,13 @@ import type {
   PrimName,
   BinaryOp,
 } from "./ast.ts";
-import { type Token, type TokenKind } from "./lexer.ts";
+import {
+  type LexerState,
+  type Token,
+  type TokenKind,
+  pullToken,
+  scanJsxText,
+} from "./lexer.ts";
 
 const PRIM_NAMES = new Set<string>([
   "string",
@@ -36,19 +44,28 @@ const PRIM_NAMES = new Set<string>([
 ]);
 
 type Parser = {
-  tokens: Token[];
+  lexer: LexerState;
   index: number;
   file: string;
   diagnostics: Diagnostic[];
 };
 
+function ensure(p: Parser, index: number): void {
+  while (p.lexer.tokens.length <= index && !p.lexer.finished) {
+    pullToken(p.lexer);
+  }
+}
+
 function current(p: Parser): Token {
-  return p.tokens[p.index] ?? p.tokens[p.tokens.length - 1]!;
+  ensure(p, p.index);
+  return p.lexer.tokens[p.index] ?? p.lexer.tokens[p.lexer.tokens.length - 1]!;
 }
 
 function peek(p: Parser, offset = 0): Token {
+  ensure(p, p.index + offset);
   return (
-    p.tokens[p.index + offset] ?? p.tokens[p.tokens.length - 1]!
+    p.lexer.tokens[p.index + offset] ??
+    p.lexer.tokens[p.lexer.tokens.length - 1]!
   );
 }
 
@@ -72,7 +89,7 @@ function advance(p: Parser): Token {
 }
 
 function previous(p: Parser): Token {
-  return p.tokens[p.index - 1] ?? current(p);
+  return p.lexer.tokens[p.index - 1] ?? current(p);
 }
 
 function spanOf(start: Token, end: Token): Span {
@@ -898,6 +915,11 @@ function parsePrimary(p: Parser): Expr {
     return parseParenOrArrow(p);
   }
 
+  // JSX only in primary position, so `a < b` stays a comparison.
+  if (at(p, "<") && jsxAhead(p)) {
+    return parseJsx(p);
+  }
+
   // Unsupported lone | or & already handled in additive; here for primary errors.
   if (at(p, "|") || at(p, "&")) {
     const tok = advance(p);
@@ -917,6 +939,269 @@ function parsePrimary(p: Parser): Expr {
     advance(p);
   }
   return { kind: "ident", name: "_", span: tokenSpan(tok) };
+}
+
+function jsxAhead(p: Parser): boolean {
+  const next = peek(p, 1);
+  return next.kind === "ident" || next.kind === "keyword" || next.kind === ">";
+}
+
+/**
+ * Text that contains a newline is trimmed at both ends and internal line
+ * breaks collapse to a single space. A chunk that is only whitespace is
+ * dropped. Chunks with no newline keep their spaces, so `Hello {name}`
+ * keeps the space.
+ */
+function normalizeJsxText(text: string): string | null {
+  if (text.length === 0) return null;
+  if (!text.includes("\n") && !text.includes("\r")) return text;
+  let out = text.replace(/^[ \t]*(?:\r\n|\n|\r)[ \t\n\r]*/, "");
+  out = out.replace(/[ \t\n\r]*(?:\r\n|\n|\r)[ \t]*$/, "");
+  if (out.length === 0) return null;
+  out = out.replace(/[ \t]*(?:\r\n|\n|\r)[ \t]*/g, " ");
+  return out.length === 0 ? null : out;
+}
+
+function tagText(tag: string | null): string {
+  return tag === null ? "fragment" : tag;
+}
+
+function parseJsx(p: Parser): Expr {
+  const startTok = advance(p); // <
+  if (at(p, ">")) {
+    advance(p);
+    const children = parseJsxChildren(p, null);
+    return {
+      kind: "jsx",
+      tag: null,
+      tagSpan: null,
+      attributes: [],
+      children,
+      span: { start: startTok.span.start, end: previous(p).span.end },
+    };
+  }
+
+  const nameTok = parseJsxTagName(p);
+  const tag = nameTok.text;
+  const tagSpan = tokenSpan(nameTok);
+  const attributes: JsxAttribute[] = [];
+  let selfClosing = false;
+
+  while (!at(p, ">") && !at(p, "/") && !at(p, "eof") && !at(p, "<")) {
+    const before = p.index;
+    const attr = parseJsxAttribute(p);
+    if (attr !== null) attributes.push(attr);
+    if (p.index === before) {
+      if (at(p, "eof")) break;
+      advance(p);
+    }
+  }
+
+  if (at(p, "/")) {
+    advance(p);
+    selfClosing = true;
+  }
+  let opened = false;
+  if (at(p, ">")) {
+    advance(p);
+    opened = true;
+  } else {
+    diag(
+      p,
+      "jsv.parse.jsx_unclosed",
+      `JSX element '${tagText(tag)}' is missing '>'`,
+      { start: startTok.span.start, end: current(p).span.end },
+      "close the tag with '>' or '/>'",
+    );
+  }
+
+  const children =
+    selfClosing || !opened ? [] : parseJsxChildren(p, tag);
+  return {
+    kind: "jsx",
+    tag,
+    tagSpan,
+    attributes,
+    children,
+    span: { start: startTok.span.start, end: previous(p).span.end },
+  };
+}
+
+function parseJsxTagName(p: Parser): Token {
+  if (at(p, "ident") || at(p, "keyword")) return advance(p);
+  unexpected(p, "JSX tag name");
+  return current(p);
+}
+
+function parseJsxAttribute(p: Parser): JsxAttribute | null {
+  if (at(p, "{")) {
+    const tok = advance(p);
+    diag(
+      p,
+      "jsv.parse.jsx_spread",
+      "JSX spread attributes are not supported",
+      tokenSpan(tok),
+      "write each attribute as name={expr} or name=\"value\"",
+    );
+    if (!at(p, "}")) {
+      parseExpr(p);
+    }
+    if (at(p, "}")) advance(p);
+    return null;
+  }
+
+  if (!at(p, "ident") && !at(p, "keyword")) {
+    unexpected(p, "JSX attribute");
+    return null;
+  }
+
+  const nameTok = advance(p);
+  if (!at(p, "=")) {
+    diag(
+      p,
+      "jsv.parse.jsx_attribute",
+      `JSX attribute '${nameTok.text}' requires a value`,
+      tokenSpan(nameTok),
+      "write name={expr} or name=\"value\"",
+    );
+    return null;
+  }
+  advance(p); // =
+
+  let value: Expr;
+  if (at(p, "string")) {
+    const tok = advance(p);
+    value = {
+      kind: "string",
+      value: String(tok.value ?? ""),
+      span: tokenSpan(tok),
+    };
+  } else if (at(p, "{")) {
+    const open = advance(p);
+    if (at(p, "}")) {
+      const close = advance(p);
+      diag(
+        p,
+        "jsv.parse.jsx_empty",
+        "JSX attribute value is empty",
+        spanOf(open, close),
+      );
+      value = { kind: "ident", name: "_", span: spanOf(open, close) };
+    } else {
+      value = parseExpr(p);
+      expect(p, "}", "`}`");
+    }
+  } else {
+    const tok = current(p);
+    diag(
+      p,
+      "jsv.parse.jsx_attribute",
+      `JSX attribute '${nameTok.text}' requires a string or {expr} value`,
+      tokenSpan(nameTok),
+    );
+    if (tok.kind !== "eof") advance(p);
+    value = { kind: "ident", name: "_", span: tokenSpan(tok) };
+  }
+
+  return {
+    name: nameTok.text,
+    nameSpan: tokenSpan(nameTok),
+    value,
+    span: { start: nameTok.span.start, end: value.span.end },
+  };
+}
+
+function parseJsxChildren(p: Parser, tag: string | null): JsxChild[] {
+  const children: JsxChild[] = [];
+  for (;;) {
+    const scanned = scanJsxText(p.lexer);
+    const normalized = normalizeJsxText(scanned.value);
+    if (normalized !== null) {
+      children.push({ kind: "text", value: normalized, span: scanned.span });
+    }
+
+    if (scanned.endedBy === "eof") {
+      diag(
+        p,
+        "jsv.parse.jsx_unclosed",
+        `JSX element '${tagText(tag)}' is missing a closing tag`,
+        scanned.span,
+        tag === null ? "close the fragment with '</>'" : `close it with '</${tag}>'`,
+      );
+      break;
+    }
+
+    if (scanned.endedBy === "lbrace") {
+      const open = expect(p, "{", "`{`");
+      if (at(p, "}")) {
+        const close = advance(p);
+        diag(
+          p,
+          "jsv.parse.jsx_empty",
+          "JSX expression child is empty",
+          spanOf(open, close),
+        );
+        continue;
+      }
+      const expr = parseExpr(p);
+      const close = expect(p, "}", "`}`");
+      children.push({
+        kind: "expr",
+        expr,
+        span: { start: open.span.start, end: close.span.end },
+      });
+      continue;
+    }
+
+    // `<` starts a nested element or the closing tag.
+    if (peek(p, 1).kind === "/") {
+      parseJsxClose(p, tag);
+      break;
+    }
+    const nested = parseJsx(p);
+    children.push({ kind: "expr", expr: nested, span: nested.span });
+  }
+  return children;
+}
+
+function parseJsxClose(p: Parser, tag: string | null): void {
+  expect(p, "<", "`<`");
+  expect(p, "/", "`/`");
+  if (tag === null) {
+    if (at(p, "ident") || at(p, "keyword")) {
+      const nameTok = advance(p);
+      diag(
+        p,
+        "jsv.parse.jsx_mismatch",
+        `Closing tag '</${nameTok.text}>' does not match fragment '<>'`,
+        tokenSpan(nameTok),
+      );
+    }
+    expect(p, ">", "`>`");
+    return;
+  }
+  if (!at(p, "ident") && !at(p, "keyword")) {
+    diag(
+      p,
+      "jsv.parse.jsx_mismatch",
+      `Closing tag for '${tag}' is missing its name`,
+      tokenSpan(current(p)),
+      `expected '</${tag}>'`,
+    );
+    if (at(p, ">")) advance(p);
+    return;
+  }
+  const nameTok = advance(p);
+  if (nameTok.text !== tag) {
+    diag(
+      p,
+      "jsv.parse.jsx_mismatch",
+      `Closing tag '</${nameTok.text}>' does not match '<${tag}>'`,
+      tokenSpan(nameTok),
+      `expected '</${tag}>'`,
+    );
+  }
+  expect(p, ">", "`>`");
 }
 
 function parseTemplate(p: Parser): Expr {
@@ -1753,21 +2038,18 @@ function parseReturn(p: Parser): ReturnStmt {
   };
 }
 
-export function parseTokens(
-  tokens: Token[],
-  file: string,
-  lexerDiagnostics: Diagnostic[],
+export function parseProgram(
+  lexer: LexerState,
 ): { program: Program; diagnostics: Diagnostic[] } {
   const p: Parser = {
-    tokens,
+    lexer,
     index: 0,
-    file,
-    diagnostics: [...lexerDiagnostics],
+    file: lexer.file,
+    diagnostics: lexer.diagnostics,
   };
 
   const body: Statement[] = [];
-  const startPos: SourcePosition =
-    tokens[0]?.span.start ?? { line: 1, column: 1 };
+  const startPos: SourcePosition = current(p).span.start;
 
   while (!at(p, "eof")) {
     const before = p.index;
@@ -1780,8 +2062,8 @@ export function parseTokens(
   }
 
   const endPos =
-    tokens.length > 0
-      ? tokens[tokens.length - 1]!.span.end
+    p.lexer.tokens.length > 0
+      ? p.lexer.tokens[p.lexer.tokens.length - 1]!.span.end
       : startPos;
 
   const program: Program = {

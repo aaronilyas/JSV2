@@ -81,6 +81,25 @@ list(items, key, (item: number) => {
   assert.ok(!ok.issues.some((i) => i.code === "jsv.dom.list_unused_item"));
 });
 
+test("domAnalyze treats <each> as a list", () => {
+  const unused = `<each items={rows} key={(row: Row) => row.id}>
+  {(item: Signal<Row>) => { return 1; }}
+</each>;
+`;
+  const bad = domAnalyze(unused, "t.jsv");
+  assert.equal(bad.lists.length, 1);
+  assert.ok(bad.issues.some((i) => i.code === "jsv.dom.list_unused_item"));
+
+  const used = `<each items={rows} key={(row: Row) => row.id}>
+  {(item: Signal<Row>) => <li>{item.get().label}</li>}
+</each>;
+`;
+  const ok = domAnalyze(used, "t.jsv");
+  assert.equal(ok.lists.length, 1);
+  assert.ok(!ok.issues.some((i) => i.code === "jsv.dom.list_unused_item"));
+  assert.equal(ok.diagnostics.length, 0);
+});
+
 test("domAnalyze respects import aliases", () => {
   const source = `import { signal as s } from "jsv/dom";
 function f(): void {

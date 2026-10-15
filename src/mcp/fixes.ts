@@ -348,6 +348,12 @@ function findUse(program: Program, line: number, column: number): NameUse | null
         walkExpr(expr.expression);
         walkType(expr.type);
         return;
+      case "jsx":
+        for (const attr of expr.attributes) walkExpr(attr.value);
+        for (const child of expr.children) {
+          if (child.kind === "expr") walkExpr(child.expr);
+        }
+        return;
       default: {
         const _exhaustive: never = expr;
         return _exhaustive;

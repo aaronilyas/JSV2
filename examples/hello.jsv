@@ -1,9 +1,9 @@
-import { signal, h, text, renderToString, Node } from "jsv/dom";
+import { signal, renderToString, Node } from "jsv/dom";
 
 let name = signal<string>("Ada");
 
 function view(): Node {
-  return h("p", {}, [text(name)]);
+  return <p>{name}</p>;
 }
 
 console.log(renderToString(view()));

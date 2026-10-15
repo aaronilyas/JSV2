@@ -110,7 +110,7 @@ A missing `const` initializer (`jsv.parse.const_missing_init`), `jsv.check.not_a
 
 **Result:** `{ signals: Span[], effects: Span[], lists: Span[], issues: Diagnostic[], diagnostics: Diagnostic[] }`
 
-Pure AST analysis of calls imported from `"jsv/dom"` (`signal`, `computed`, `effect`, `list`, including `as` renames). Does **not** load WASM or import the runtime graph/DOM modules.
+Pure AST analysis of calls imported from `"jsv/dom"` (`signal`, `computed`, `effect`, `list`, including `as` renames) and of JSX `<each>` elements. Does **not** load WASM or import the runtime graph/DOM modules. `<each>` is recorded in `lists` and uses the same unused-render-parameter warning as `list()`.
 
 `diagnostics` holds parser diagnostics from `parse()`, plus input failures (`jsv.mcp.missing_input` when both `source` and `path` are absent, `jsv.check.module_not_found` when `path` cannot be read). Parse errors do **not** suppress walking the partial AST: inventories and DOM `issues` are still collected from whatever program the parser returned. Parser diagnostics and input failures are never copied into `issues`. A clean file has `diagnostics: []`. `issues` holds only DOM warnings.
 

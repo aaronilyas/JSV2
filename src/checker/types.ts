@@ -272,6 +272,15 @@ export function intersectNarrow(from: Type, target: Type): Type {
 
 type VisitSet = Set<string>;
 
+/**
+ * `pending` means this pair is on the stack. Re-entering it is a recursive
+ * type, so that occurrence is treated as assignable. A finished pair stores
+ * the boolean result. A failed comparison must stay failed when another union
+ * member asks the same question (Signal<number> vs Signal<string> and then
+ * Computed<string> share `() => number <: () => string`).
+ */
+type AssignState = Map<string, boolean | "pending">;
+
 function pairKey(a: Type, b: Type): string {
   return `${typeToString(a)}<:${typeToString(b)}`;
 }
@@ -279,15 +288,22 @@ function pairKey(a: Type, b: Type): string {
 export function isAssignable(
   source: Type,
   target: Type,
-  visited?: VisitSet,
+  visited?: AssignState,
 ): boolean {
   if (source.kind === "error" || target.kind === "error") return true;
 
-  const seen = visited ?? new Set<string>();
+  const seen = visited ?? new Map<string, boolean | "pending">();
   const key = pairKey(source, target);
-  if (seen.has(key)) return true;
-  seen.add(key);
+  const prev = seen.get(key);
+  if (prev === "pending") return true;
+  if (prev !== undefined) return prev;
+  seen.set(key, "pending");
+  const result = assignable(source, target, seen);
+  seen.set(key, result);
+  return result;
+}
 
+function assignable(source: Type, target: Type, seen: AssignState): boolean {
   if (isNever(source)) return true;
   if (isNever(target)) return isNever(source);
   if (isUnknown(target)) return true;
@@ -381,7 +397,7 @@ export function typesOverlap(a: Type, b: Type, visited?: VisitSet): boolean {
     return typesOverlap(a.element, b.element, seen);
   }
 
-  return isAssignable(a, b, seen) || isAssignable(b, a, seen);
+  return isAssignable(a, b) || isAssignable(b, a);
 }
 
 export function propertyNames(type: Type): string[] {

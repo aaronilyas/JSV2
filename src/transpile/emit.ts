@@ -6,10 +6,12 @@ import type {
   Expr,
   FunctionDecl,
   ImportStmt,
+  JsxChild,
   Program,
   Statement,
   VarStmt,
 } from "../parser/ast.ts";
+import { KEYWORDS } from "../parser/lexer.ts";
 
 /** Value exports from the ambient `jsv/dom` module. */
 export const JSV_DOM_VALUE_NAMES = new Set([
@@ -127,6 +129,8 @@ function exprPrec(expr: Expr): number {
     case "index":
     case "new":
       return PREC_POSTFIX;
+    case "jsx":
+      return PREC_PRIMARY;
     default:
       return PREC_PRIMARY;
   }
@@ -291,11 +295,253 @@ function emitExprRaw(expr: Expr, options: EmitOptions): string {
     }
     case "assert":
       return emitExprRaw(expr.expression, options);
+    case "jsx":
+      return emitJsx(expr, options);
     default: {
       const _exhaustive: never = expr;
       return _exhaustive;
     }
   }
+}
+
+function isComponentTag(tag: string): boolean {
+  const c = tag.charCodeAt(0) ?? 0;
+  return c >= 65 && c <= 90;
+}
+
+function emitKey(name: string): string {
+  if (KEYWORDS.has(name)) return JSON.stringify(name);
+  return name;
+}
+
+/** Intrinsic elements, fragments, and `<each>` always produce a Node. */
+function jsxEmitsNode(expr: Extract<Expr, { kind: "jsx" }>): boolean {
+  if (expr.tag === null || expr.tag === "each") return true;
+  return !isComponentTag(expr.tag);
+}
+
+function emitJsxChild(child: JsxChild, options: EmitOptions): string {
+  if (child.kind === "text") return `__jsv_text(${JSON.stringify(child.value)})`;
+  if (child.expr.kind === "string") {
+    return `__jsv_text(${JSON.stringify(child.expr.value)})`;
+  }
+  if (child.expr.kind === "jsx" && jsxEmitsNode(child.expr)) {
+    return emitJsx(child.expr, options);
+  }
+  return `__jsv_jsxChild(${emitExpr(child.expr, options)})`;
+}
+
+function emitJsx(
+  expr: Extract<Expr, { kind: "jsx" }>,
+  options: EmitOptions,
+): string {
+  if (expr.tag === "each") {
+    const items = expr.attributes.find((a) => a.name === "items");
+    const key = expr.attributes.find((a) => a.name === "key");
+    const render = expr.children.find((c) => c.kind === "expr");
+    const itemsCode = items !== undefined ? emitExpr(items.value, options) : "undefined";
+    const keyCode = key !== undefined ? emitExpr(key.value, options) : "undefined";
+    const renderCode =
+      render !== undefined && render.kind === "expr"
+        ? emitExpr(render.expr, options)
+        : "undefined";
+    return `__jsv_list(${itemsCode}, ${keyCode}, ${renderCode})`;
+  }
+
+  if (expr.tag !== null && isComponentTag(expr.tag)) {
+    const fields: string[] = [];
+    for (const attr of expr.attributes) {
+      fields.push(`${emitKey(attr.name)}: ${emitExpr(attr.value, options)}`);
+    }
+    if (expr.children.length > 0) {
+      const kids = expr.children.map((c) => emitJsxChild(c, options)).join(", ");
+      fields.push(`children: [${kids}]`);
+    }
+    if (fields.length === 0) return `${expr.tag}()`;
+    return `${expr.tag}({ ${fields.join(", ")} })`;
+  }
+
+  const kids = expr.children.map((c) => emitJsxChild(c, options)).join(", ");
+  if (expr.tag === null) return `__jsv_fragment([${kids}])`;
+
+  const props: string[] = [];
+  for (const attr of expr.attributes) {
+    const name = attr.name === "class" ? "className" : attr.name;
+    props.push(`${emitKey(name)}: ${emitExpr(attr.value, options)}`);
+  }
+  const propObj = props.length === 0 ? "{}" : `{ ${props.join(", ")} }`;
+  return `__jsv_h(${JSON.stringify(expr.tag)}, ${propObj}, [${kids}])`;
+}
+
+type JsxRuntimeName = "fragment" | "h" | "jsxChild" | "list" | "text";
+
+function noteJsxChild(child: JsxChild, need: Set<JsxRuntimeName>, walk: (e: Expr) => void): void {
+  if (child.kind === "text") {
+    need.add("text");
+    return;
+  }
+  walk(child.expr);
+  if (child.expr.kind === "string") need.add("text");
+  else if (child.expr.kind === "jsx" && jsxEmitsNode(child.expr)) {
+    // nested intrinsic is emitted directly
+  } else need.add("jsxChild");
+}
+
+function collectJsxNeeds(program: Program): JsxRuntimeName[] {
+  const need = new Set<JsxRuntimeName>();
+
+  const walkExpr = (expr: Expr): void => {
+    switch (expr.kind) {
+      case "number":
+      case "string":
+      case "boolean":
+      case "null":
+      case "undefined":
+      case "ident":
+        return;
+      case "template":
+        for (const part of expr.parts) {
+          if (part.kind === "expr") walkExpr(part.expr);
+        }
+        return;
+      case "array":
+        for (const el of expr.elements) walkExpr(el);
+        return;
+      case "object":
+        for (const prop of expr.properties) walkExpr(prop.value);
+        return;
+      case "unary":
+        walkExpr(expr.argument);
+        return;
+      case "binary":
+        walkExpr(expr.left);
+        walkExpr(expr.right);
+        return;
+      case "assign":
+        walkExpr(expr.target);
+        walkExpr(expr.value);
+        return;
+      case "ternary":
+        walkExpr(expr.test);
+        walkExpr(expr.consequent);
+        walkExpr(expr.alternate);
+        return;
+      case "call":
+        walkExpr(expr.callee);
+        for (const arg of expr.args) walkExpr(arg);
+        return;
+      case "member":
+        walkExpr(expr.object);
+        return;
+      case "index":
+        walkExpr(expr.object);
+        walkExpr(expr.index);
+        return;
+      case "new":
+        walkExpr(expr.callee);
+        for (const arg of expr.args) walkExpr(arg);
+        return;
+      case "arrow":
+        if (expr.body.kind === "block") walkStmts(expr.body.body);
+        else walkExpr(expr.body);
+        return;
+      case "assert":
+        walkExpr(expr.expression);
+        return;
+      case "jsx":
+        walkJsx(expr);
+        return;
+      default: {
+        const _exhaustive: never = expr;
+        return _exhaustive;
+      }
+    }
+  };
+
+  const walkJsx = (expr: Extract<Expr, { kind: "jsx" }>): void => {
+    for (const attr of expr.attributes) walkExpr(attr.value);
+    if (expr.tag === "each") {
+      need.add("list");
+      for (const child of expr.children) {
+        if (child.kind === "expr") walkExpr(child.expr);
+      }
+      return;
+    }
+    if (expr.tag === null) need.add("fragment");
+    else if (!isComponentTag(expr.tag)) need.add("h");
+    for (const child of expr.children) noteJsxChild(child, need, walkExpr);
+  };
+
+  const walkStmts = (stmts: readonly Statement[]): void => {
+    for (const stmt of stmts) walkStmt(stmt);
+  };
+
+  const walkStmt = (stmt: Statement): void => {
+    switch (stmt.kind) {
+      case "import":
+      case "empty":
+      case "type_alias":
+      case "interface":
+        return;
+      case "var":
+        if (stmt.init !== null) walkExpr(stmt.init);
+        return;
+      case "function":
+        walkStmts(stmt.body.body);
+        return;
+      case "class":
+        for (const member of stmt.members) {
+          if (member.kind === "constructor" || member.kind === "method") {
+            walkStmts(member.body.body);
+          }
+        }
+        return;
+      case "if":
+        walkExpr(stmt.test);
+        walkStmt(stmt.consequent);
+        if (stmt.alternate !== null) walkStmt(stmt.alternate);
+        return;
+      case "while":
+        walkExpr(stmt.test);
+        walkStmt(stmt.body);
+        return;
+      case "for":
+        if (stmt.init !== null) {
+          if (stmt.init.kind === "var") {
+            if (stmt.init.init !== null) walkExpr(stmt.init.init);
+          } else walkExpr(stmt.init);
+        }
+        if (stmt.test !== null) walkExpr(stmt.test);
+        if (stmt.update !== null) walkExpr(stmt.update);
+        walkStmt(stmt.body);
+        return;
+      case "return":
+        if (stmt.argument !== null) walkExpr(stmt.argument);
+        return;
+      case "block":
+        walkStmts(stmt.body);
+        return;
+      case "expr_stmt":
+        walkExpr(stmt.expression);
+        return;
+      default: {
+        const _exhaustive: never = stmt;
+        return _exhaustive;
+      }
+    }
+  };
+
+  walkStmts(program.body);
+  const order: JsxRuntimeName[] = ["fragment", "h", "jsxChild", "list", "text"];
+  return order.filter((name) => need.has(name));
+}
+
+function emitJsxRuntimeImport(program: Program, options: EmitOptions): string | null {
+  const names = collectJsxNeeds(program);
+  if (names.length === 0) return null;
+  const spec = options.resolveImport("jsv/dom").specifier;
+  const named = names.map((name) => `${name} as __jsv_${name}`).join(", ");
+  return `import { ${named} } from ${JSON.stringify(spec)};`;
 }
 
 function emitVar(stmt: VarStmt, ctx: EmitCtx, inFor = false): string {
@@ -460,5 +706,7 @@ function emitStatement(stmt: Statement, ctx: EmitCtx): string {
 
 export function emitProgram(program: Program, options: EmitOptions): string {
   const lines = emitStatementList(program.body, options);
+  const runtime = emitJsxRuntimeImport(program, options);
+  if (runtime !== null) lines.unshift(runtime);
   return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
 }

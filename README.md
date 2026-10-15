@@ -48,11 +48,11 @@ Options:
 
 Diagnostics always go to stdout. See [docs/syntax.md](docs/syntax.md) for the language subset, [docs/types.md](docs/types.md) for typechecker rules, and [docs/run.md](docs/run.md) for `jsv run`.
 
-Examples: [examples/hello.jsv](examples/hello.jsv) (backend `renderToString`) and [examples/counter.jsv](examples/counter.jsv) (exported component for a host `mount`).
+Examples: [examples/hello.jsv](examples/hello.jsv) (backend `renderToString`), [examples/counter.jsv](examples/counter.jsv) (exported component for a host `mount`), and [examples/todos.jsv](examples/todos.jsv) (keyed `<each>`).
 
 ## DOM
 
-React is not used. Components are functions that return nodes; updates are per text/attribute/keyed list. Import from `jsv/dom` in `.jsv` sources. See [docs/dom.md](docs/dom.md).
+React is not used. Components are functions that return nodes; updates are per text/attribute/keyed list. `.jsv` sources can write JSX (`<button>{label}</button>`, `<each>`) which lowers to `h` / `text` / `list`, or call those functions directly. Import signals from `jsv/dom`. See [docs/dom.md](docs/dom.md).
 
 ## Runtime loading
 

@@ -137,6 +137,32 @@ export function fragment(children: readonly Node[]): Node {
   return node;
 }
 
+function isDomNode(value: unknown): value is Node {
+  if (typeof value !== "object" || value === null || !("nodeKind" in value)) {
+    return false;
+  }
+  const kind = (value as { nodeKind?: unknown }).nodeKind;
+  return (
+    kind === "text" ||
+    kind === "element" ||
+    kind === "fragment" ||
+    kind === "list"
+  );
+}
+
+/**
+ * JSX lowering helper. Nodes pass through. Arrays of nodes become a
+ * fragment. Strings and string signals become a text node so `{label}`
+ * stays fine-grained.
+ */
+export function jsxChild(
+  value: Node | readonly Node[] | string | Signal<string> | Computed<string>,
+): Node {
+  if (isDomNode(value)) return value;
+  if (Array.isArray(value)) return fragment(value as readonly Node[]);
+  return text(value as string | Signal<string> | Computed<string>);
+}
+
 export function list<T>(
   items: Signal<readonly T[]> | Computed<readonly T[]>,
   key: (item: T) => string,

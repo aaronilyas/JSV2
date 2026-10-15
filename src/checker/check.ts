@@ -8,6 +8,7 @@ import type {
   Expr,
   FunctionDecl,
   InterfaceDecl,
+  JsxChild,
   Program,
   Span,
   Statement,
@@ -21,6 +22,7 @@ import {
   ERROR_TYPE,
   arrayType,
   excludeType,
+  expand,
   functionType,
   getProperty,
   intersectNarrow,
@@ -1539,11 +1541,523 @@ function checkExprBody(
       return checkArrow(ctx, expr, expected);
     case "assert":
       return checkAssert(ctx, expr);
+    case "jsx":
+      return checkJsx(ctx, expr);
     default: {
       const _exhaustive: never = expr;
       return _exhaustive;
     }
   }
+}
+
+const JSX_INTRINSIC_PROPS: Record<string, string> = {
+  id: "id",
+  class: "className",
+  className: "className",
+  value: "value",
+  onClick: "onClick",
+  onInput: "onInput",
+};
+
+const JSX_VOID_TAGS = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "source",
+  "track",
+  "wbr",
+]);
+
+type DomTypes = {
+  node: Type;
+  stringish: Type;
+  nodeArray: Type;
+  signalDef: TypeDef;
+  computedDef: TypeDef;
+  props: Type;
+};
+
+function isComponentTag(tag: string): boolean {
+  const c = tag.charCodeAt(0) ?? 0;
+  return c >= 65 && c <= 90;
+}
+
+function domTypes(ctx: CheckerContext): DomTypes | null {
+  let mod = ctx.moduleCache.get("jsv/dom");
+  if (mod === undefined) {
+    mod = createDomLibModule() as ModuleResult;
+    ctx.moduleCache.set("jsv/dom", mod);
+  }
+  const nodeDef = mod.namedTypes.get("Node")?.typeDef;
+  const signalDef = mod.namedTypes.get("Signal")?.typeDef;
+  const computedDef = mod.namedTypes.get("Computed")?.typeDef;
+  const propsDef = mod.namedTypes.get("DomProps")?.typeDef;
+  if (
+    nodeDef === undefined ||
+    signalDef === undefined ||
+    computedDef === undefined ||
+    propsDef === undefined
+  ) {
+    return null;
+  }
+  const node = refType(nodeDef);
+  return {
+    node,
+    stringish: unionType([
+      prim("string"),
+      refType(signalDef, [prim("string")]),
+      refType(computedDef, [prim("string")]),
+    ]),
+    nodeArray: arrayType(node),
+    signalDef,
+    computedDef,
+    props: refType(propsDef),
+  };
+}
+
+function acceptsJsxChild(type: Type, dom: DomTypes): boolean {
+  if (type.kind === "error") return true;
+  return (
+    isAssignable(type, dom.node) ||
+    isAssignable(type, dom.stringish) ||
+    isAssignable(type, dom.nodeArray)
+  );
+}
+
+function checkJsxChild(ctx: CheckerContext, child: JsxChild, dom: DomTypes): void {
+  if (child.kind === "text") return;
+  const t = checkExpr(ctx, child.expr, null);
+  rejectVoidValue(ctx, t, child.expr.span);
+  if (acceptsJsxChild(t, dom)) return;
+  diag(
+    ctx,
+    "jsv.check.jsx_child",
+    `JSX child type '${typeToString(t)}' is not a node or string.`,
+    child.span,
+    "Use an element, a Node, a Node[], or a string / Signal<string> / Computed<string>.",
+  );
+}
+
+function checkJsxChildren(
+  ctx: CheckerContext,
+  children: JsxChild[],
+  dom: DomTypes,
+): void {
+  for (const child of children) checkJsxChild(ctx, child, dom);
+}
+
+function checkJsx(ctx: CheckerContext, expr: Extract<Expr, { kind: "jsx" }>): Type {
+  const dom = domTypes(ctx);
+  if (dom === null) return ERROR_TYPE;
+  if (expr.tag === null) {
+    checkJsxChildren(ctx, expr.children, dom);
+    return dom.node;
+  }
+  if (expr.tag === "each") return checkJsxEach(ctx, expr, dom);
+  if (isComponentTag(expr.tag)) return checkJsxComponent(ctx, expr, dom);
+  return checkJsxIntrinsic(ctx, expr, dom);
+}
+
+function checkJsxIntrinsic(
+  ctx: CheckerContext,
+  expr: Extract<Expr, { kind: "jsx" }>,
+  dom: DomTypes,
+): Type {
+  const tag = expr.tag ?? "";
+  const seen = new Set<string>();
+  for (const attr of expr.attributes) {
+    const canonical = JSX_INTRINSIC_PROPS[attr.name];
+    if (canonical === undefined) {
+      checkExpr(ctx, attr.value, null);
+      diag(
+        ctx,
+        "jsv.check.jsx_attribute",
+        `Unknown attribute '${attr.name}' on <${tag}>.`,
+        attr.nameSpan,
+        "Known attributes: id, class, className, value, onClick, onInput.",
+      );
+      continue;
+    }
+    if (seen.has(canonical)) {
+      diag(
+        ctx,
+        "jsv.check.jsx_attribute",
+        `Attribute '${canonical}' is set more than once on <${tag}>.`,
+        attr.nameSpan,
+        canonical === "className"
+          ? "class and className are the same attribute"
+          : undefined,
+      );
+    }
+    seen.add(canonical);
+    const prop = getProperty(dom.props, canonical);
+    const expected = prop?.type ?? null;
+    const t = checkExpr(ctx, attr.value, expected);
+    rejectVoidValue(ctx, t, attr.value.span);
+    if (expected !== null) {
+      checkAssignability(ctx, t, expected, attr.value.span);
+    }
+  }
+  checkJsxChildren(ctx, expr.children, dom);
+  if (JSX_VOID_TAGS.has(tag) && expr.children.length > 0) {
+    diag(
+      ctx,
+      "jsv.check.jsx_void_children",
+      `Void element <${tag}> cannot have children.`,
+      expr.span,
+      "use a self-closing tag: <" + tag + " />",
+    );
+  }
+  return dom.node;
+}
+
+function listItemType(
+  type: Type,
+  signalDef: TypeDef,
+  computedDef: TypeDef,
+  seen: Set<TypeDef> = new Set(),
+): Type | null {
+  if (type.kind === "error") return null;
+  if (type.kind === "union") {
+    let acc: Type | null = null;
+    for (const member of type.members) {
+      const item = listItemType(member, signalDef, computedDef, seen);
+      if (item === null) return null;
+      if (acc === null) acc = item;
+      else if (!typesEqual(acc, item)) return null;
+    }
+    return acc;
+  }
+  if (type.kind !== "ref") return null;
+  if (type.def === signalDef || type.def === computedDef) {
+    const arg = type.args[0];
+    if (arg === undefined) return null;
+    const inner = unwrap(arg);
+    if (inner.kind !== "array") return null;
+    return inner.element;
+  }
+  if (seen.has(type.def)) return null;
+  seen.add(type.def);
+  return listItemType(expand(type), signalDef, computedDef, seen);
+}
+
+function checkJsxEach(
+  ctx: CheckerContext,
+  expr: Extract<Expr, { kind: "jsx" }>,
+  dom: DomTypes,
+): Type {
+  let itemsExpr: Expr | null = null;
+  let keyExpr: Expr | null = null;
+  const seen = new Set<string>();
+  for (const attr of expr.attributes) {
+    if (seen.has(attr.name)) {
+      diag(
+        ctx,
+        "jsv.check.jsx_each",
+        `Attribute '${attr.name}' is set more than once on <each>.`,
+        attr.nameSpan,
+      );
+    }
+    seen.add(attr.name);
+    if (attr.name === "items") {
+      if (itemsExpr === null) itemsExpr = attr.value;
+      else checkExpr(ctx, attr.value, null);
+    } else if (attr.name === "key") {
+      if (keyExpr === null) keyExpr = attr.value;
+      else checkExpr(ctx, attr.value, null);
+    } else {
+      checkExpr(ctx, attr.value, null);
+      diag(
+        ctx,
+        "jsv.check.jsx_each",
+        `Unknown attribute '${attr.name}' on <each>.`,
+        attr.nameSpan,
+        "each takes items and key.",
+      );
+    }
+  }
+  if (itemsExpr === null) {
+    diag(
+      ctx,
+      "jsv.check.jsx_each",
+      "<each> requires an items attribute.",
+      expr.tagSpan ?? expr.span,
+      "items is a Signal<T[]> or Computed<T[]>.",
+    );
+  }
+  if (keyExpr === null) {
+    diag(
+      ctx,
+      "jsv.check.jsx_each",
+      "<each> requires a key attribute.",
+      expr.tagSpan ?? expr.span,
+      "key is (item: T) => string.",
+    );
+  }
+
+  const itemsType = itemsExpr !== null ? checkExpr(ctx, itemsExpr, null) : ERROR_TYPE;
+  if (itemsExpr !== null) rejectVoidValue(ctx, itemsType, itemsExpr.span);
+  const itemType =
+    itemsExpr === null
+      ? null
+      : listItemType(itemsType, dom.signalDef, dom.computedDef);
+  if (itemsExpr !== null && itemsType.kind !== "error" && itemType === null) {
+    diag(
+      ctx,
+      "jsv.check.jsx_each",
+      `Type '${typeToString(itemsType)}' is not a Signal<T[]> or Computed<T[]>.`,
+      itemsExpr.span,
+    );
+  }
+
+  if (keyExpr !== null && itemType !== null) {
+    const expectedKey = functionType(
+      [{ name: "item", type: itemType }],
+      prim("string"),
+    );
+    const keyType = checkExpr(ctx, keyExpr, expectedKey);
+    rejectVoidValue(ctx, keyType, keyExpr.span);
+    if (keyType.kind !== "error" && !isAssignable(keyType, expectedKey)) {
+      diag(
+        ctx,
+        "jsv.check.not_assignable",
+        `Type '${typeToString(keyType)}' is not assignable to type '${typeToString(expectedKey)}'.`,
+        keyExpr.span,
+        "key receives the list item T and must return a string.",
+      );
+    }
+  } else if (keyExpr !== null) {
+    checkExpr(ctx, keyExpr, null);
+  }
+
+  const renderChildren = expr.children.filter((c) => c.kind === "expr");
+  for (const child of expr.children) {
+    if (child.kind === "text") {
+      diag(
+        ctx,
+        "jsv.check.jsx_each",
+        "<each> cannot contain text.",
+        child.span,
+        "the only child is the render function (item: Signal<T>) => Node.",
+      );
+    }
+  }
+  if (renderChildren.length !== 1) {
+    diag(
+      ctx,
+      "jsv.check.jsx_each",
+      `<each> expects one render function, got ${renderChildren.length}.`,
+      expr.span,
+      "write {(item: Signal<T>) => <li />} inside <each>.",
+    );
+  }
+  const render = renderChildren[0];
+  if (render !== undefined && render.kind === "expr") {
+    if (itemType !== null) {
+      const expectedRender = functionType(
+        [{ name: "item", type: refType(dom.signalDef, [itemType]) }],
+        dom.node,
+      );
+      const renderType = checkExpr(ctx, render.expr, expectedRender);
+      rejectVoidValue(ctx, renderType, render.expr.span);
+      if (renderType.kind !== "error" && !isAssignable(renderType, expectedRender)) {
+        diag(
+          ctx,
+          "jsv.check.not_assignable",
+          `Type '${typeToString(renderType)}' is not assignable to type '${typeToString(expectedRender)}'.`,
+          render.span,
+          "The render callback is called with Signal<T>. Read fields with item.get().",
+        );
+      }
+    } else {
+      checkExpr(ctx, render.expr, null);
+    }
+  }
+  return dom.node;
+}
+
+function checkJsxComponent(
+  ctx: CheckerContext,
+  expr: Extract<Expr, { kind: "jsx" }>,
+  dom: DomTypes,
+): Type {
+  const name = expr.tag ?? "";
+  const tagSpan = expr.tagSpan ?? expr.span;
+  const binding = lookupBinding(ctx, name);
+  if (binding === null) {
+    diag(
+      ctx,
+      "jsv.check.unresolved_name",
+      `Unresolved name '${name}'.`,
+      tagSpan,
+    );
+    for (const attr of expr.attributes) checkExpr(ctx, attr.value, null);
+    checkJsxChildren(ctx, expr.children, dom);
+    return ERROR_TYPE;
+  }
+  if (binding.kind === "type") {
+    diag(
+      ctx,
+      "jsv.check.type_as_value",
+      `'${name}' refers to a type, but is used as a value.`,
+      tagSpan,
+    );
+    return ERROR_TYPE;
+  }
+  const fn = unwrap(binding.valueType);
+  if (fn.kind !== "function") {
+    diag(
+      ctx,
+      "jsv.check.not_callable",
+      `Type '${typeToString(binding.valueType)}' is not callable.`,
+      tagSpan,
+    );
+    for (const attr of expr.attributes) checkExpr(ctx, attr.value, null);
+    checkJsxChildren(ctx, expr.children, dom);
+    return ERROR_TYPE;
+  }
+  if (fn.typeParams.length > 0) {
+    diag(
+      ctx,
+      "jsv.check.jsx_component",
+      `Component '${name}' is generic and cannot be used as a tag.`,
+      tagSpan,
+      "Call it with explicit type arguments instead of JSX.",
+    );
+    return fn.returnType;
+  }
+
+  if (fn.params.length === 0) {
+    if (expr.attributes.length > 0 || expr.children.length > 0) {
+      diag(
+        ctx,
+        "jsv.check.jsx_component",
+        `Component '${name}' does not take props or children.`,
+        expr.span,
+        `Call it as <${name} />.`,
+      );
+    }
+    for (const attr of expr.attributes) checkExpr(ctx, attr.value, null);
+    checkJsxChildren(ctx, expr.children, dom);
+    return fn.returnType;
+  }
+
+  if (fn.params.length !== 1) {
+    diag(
+      ctx,
+      "jsv.check.jsx_component",
+      `Component '${name}' must take zero arguments or one props object.`,
+      tagSpan,
+    );
+    for (const attr of expr.attributes) checkExpr(ctx, attr.value, null);
+    checkJsxChildren(ctx, expr.children, dom);
+    return fn.returnType;
+  }
+
+  const propsType = unwrap(fn.params[0]?.type ?? ERROR_TYPE);
+  if (propsType.kind !== "object") {
+    diag(
+      ctx,
+      "jsv.check.jsx_component",
+      `Component '${name}' props must be an object type.`,
+      tagSpan,
+    );
+    for (const attr of expr.attributes) checkExpr(ctx, attr.value, null);
+    checkJsxChildren(ctx, expr.children, dom);
+    return fn.returnType;
+  }
+
+  if (expr.attributes.length === 0 && expr.children.length === 0) {
+    diag(
+      ctx,
+      "jsv.check.jsx_component",
+      `Component '${name}' takes a props argument.`,
+      tagSpan,
+      "Pass an attribute or children, or call the function directly.",
+    );
+  }
+
+  const seen = new Set<string>();
+  for (const attr of expr.attributes) {
+    if (seen.has(attr.name)) {
+      diag(
+        ctx,
+        "jsv.check.jsx_attribute",
+        `Attribute '${attr.name}' is set more than once on <${name}>.`,
+        attr.nameSpan,
+      );
+    }
+    seen.add(attr.name);
+    const prop = propsType.props.find((p) => p.name === attr.name);
+    const expected = prop?.type ?? null;
+    const t = checkExpr(ctx, attr.value, expected);
+    rejectVoidValue(ctx, t, attr.value.span);
+    if (prop === undefined) {
+      diag(
+        ctx,
+        "jsv.check.jsx_attribute",
+        `Property '${attr.name}' does not exist on props of '${name}'.`,
+        attr.nameSpan,
+        propsType.props.length > 0
+          ? `Known properties: ${propsType.props.map((p) => p.name).join(", ")}`
+          : undefined,
+      );
+    } else if (expected !== null) {
+      checkAssignability(ctx, t, expected, attr.value.span);
+    }
+  }
+
+  checkJsxChildren(ctx, expr.children, dom);
+  const childrenProp = propsType.props.find((p) => p.name === "children");
+  if (expr.children.length > 0) {
+    if (childrenProp === undefined) {
+      diag(
+        ctx,
+        "jsv.check.jsx_component",
+        `Component '${name}' does not take children.`,
+        expr.span,
+      );
+    } else if (!isAssignable(dom.nodeArray, childrenProp.type)) {
+      diag(
+        ctx,
+        "jsv.check.not_assignable",
+        `Type 'Node[]' is not assignable to type '${typeToString(childrenProp.type)}'.`,
+        expr.children[0]?.span ?? expr.span,
+        "JSX passes child elements as Node[].",
+      );
+    }
+  }
+
+  for (const prop of propsType.props) {
+    if (prop.optional) continue;
+    if (prop.name === "children") {
+      if (expr.children.length === 0) {
+        diag(
+          ctx,
+          "jsv.check.jsx_component",
+          `Component '${name}' requires children.`,
+          tagSpan,
+        );
+      }
+      continue;
+    }
+    if (!seen.has(prop.name)) {
+      diag(
+        ctx,
+        "jsv.check.jsx_component",
+        `Component '${name}' is missing prop '${prop.name}'.`,
+        tagSpan,
+      );
+    }
+  }
+  return fn.returnType;
 }
 
 function checkIdent(

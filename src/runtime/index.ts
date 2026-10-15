@@ -12,6 +12,7 @@ export {
   h,
   fragment,
   list,
+  jsxChild,
   mount,
   renderToString,
   type Node,

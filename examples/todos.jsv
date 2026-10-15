@@ -1,0 +1,18 @@
+import { signal, computed, Signal, Node } from "jsv/dom";
+
+type Row = { id: string; label: string; };
+
+export function TodoList(): Node {
+  let rows = signal<Row[]>([
+    { id: "a", label: "one" },
+    { id: "b", label: "two" },
+  ]);
+  return <ul>
+    <each items={rows} key={(row: Row) => row.id}>
+      {(row: Signal<Row>) => {
+        let label = computed<string>(() => { return row.get().label; });
+        return <li>{label}</li>;
+      }}
+    </each>
+  </ul>;
+}

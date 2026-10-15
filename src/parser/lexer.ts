@@ -85,7 +85,7 @@ export const KEYWORDS = new Set([
 
 type BraceFrame = "block" | "template";
 
-type LexerState = {
+export type LexerState = {
   source: string;
   file: string;
   index: number;
@@ -94,7 +94,117 @@ type LexerState = {
   tokens: Token[];
   diagnostics: Diagnostic[];
   braces: BraceFrame[];
+  finished: boolean;
 };
+
+export function createLexer(source: string, file: string): LexerState {
+  return {
+    source,
+    file,
+    index: 0,
+    line: 1,
+    column: 1,
+    tokens: [],
+    diagnostics: [],
+    braces: [],
+    finished: false,
+  };
+}
+
+/** Pull one token. Stops after the eof token. */
+export function pullToken(state: LexerState): void {
+  if (state.finished) return;
+  nextToken(state);
+  const last = state.tokens[state.tokens.length - 1];
+  if (last?.kind === "eof") state.finished = true;
+}
+
+export type JsxTextEnd = "lt" | "lbrace" | "eof";
+
+export type JsxTextScan = {
+  value: string;
+  span: Span;
+  endedBy: JsxTextEnd;
+};
+
+/**
+ * Read JSX child text starting at the current source index.
+ * Stops before `<` or `{` without consuming them.
+ * `{/* ... *\/}` is a comment and is omitted from the text.
+ * Does not skip whitespace and does not emit tokens.
+ */
+export function scanJsxText(state: LexerState): JsxTextScan {
+  const start = pos(state);
+  const startIndex = state.index;
+  let value = "";
+
+  const finish = (endedBy: JsxTextEnd): JsxTextScan => {
+    const end = state.index > startIndex ? lastCharPos(state) : start;
+    return { value, span: { start, end }, endedBy };
+  };
+
+  while (peek(state) !== "") {
+    const ch = peek(state);
+    if (ch === "<") return finish("lt");
+    if (ch === "{") {
+      if (peek(state, 1) === "/" && peek(state, 2) === "*") {
+        const cStart = pos(state);
+        advance(state);
+        advance(state);
+        advance(state);
+        let closed = false;
+        while (peek(state) !== "") {
+          if (peek(state) === "*" && peek(state, 1) === "/") {
+            advance(state);
+            advance(state);
+            while (
+              peek(state) === " " ||
+              peek(state) === "\t" ||
+              peek(state) === "\n" ||
+              peek(state) === "\r"
+            ) {
+              advance(state);
+            }
+            if (peek(state) === "}") {
+              advance(state);
+              closed = true;
+            } else {
+              const end = state.index > 0 ? lastCharPos(state) : cStart;
+              state.diagnostics.push(
+                makeDiag(
+                  state,
+                  "jsv.parse.unexpected_token",
+                  "JSX comment must end with `*/}`",
+                  cStart,
+                  end,
+                ),
+              );
+            }
+            break;
+          }
+          advance(state);
+        }
+        if (!closed && peek(state) === "") {
+          const end = state.index > 0 ? lastCharPos(state) : cStart;
+          state.diagnostics.push(
+            makeDiag(
+              state,
+              "jsv.parse.unterminated_comment",
+              "unterminated JSX comment",
+              cStart,
+              end,
+            ),
+          );
+          return finish("eof");
+        }
+        continue;
+      }
+      return finish("lbrace");
+    }
+    value += advance(state);
+  }
+  return finish("eof");
+}
 
 function pos(state: LexerState): SourcePosition {
   return { line: state.line, column: state.column };
@@ -632,21 +742,13 @@ export function tokenize(
   source: string,
   file: string,
 ): { tokens: Token[]; diagnostics: Diagnostic[] } {
-  const state: LexerState = {
-    source,
-    file,
-    index: 0,
-    line: 1,
-    column: 1,
-    tokens: [],
-    diagnostics: [],
-    braces: [],
-  };
+  const state = createLexer(source, file);
 
   for (;;) {
     nextToken(state);
     const last = state.tokens[state.tokens.length - 1];
     if (last?.kind === "eof") {
+      state.finished = true;
       break;
     }
   }

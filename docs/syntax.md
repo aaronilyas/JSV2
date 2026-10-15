@@ -84,7 +84,23 @@ Primary forms:
 9. Prefix unary `!` `-` `typeof`
 10. Postfix: call, `.` Ident, `[` Expr `]`, `as` Type  
     (`as` binds tighter than unary: `!x as T` is `!(x as T)`)
-11. Primary: literals, ident, `( Expr )`, array/object literals, parenthesized arrow, `new`
+11. Primary: literals, ident, `( Expr )`, array/object literals, parenthesized arrow, `new`, JSX
+
+## JSX
+
+In primary position, `<` starts an element when the next token is an identifier, a keyword, or `>`.
+
+```
+<tag attr="string" attr={Expr} />
+<tag attr={Expr}> JsxChild* </tag>
+<> JsxChild* </>
+```
+
+`JsxChild` is text, `{ Expr }`, a nested element, or a fragment. `{/* comment */}` is a comment. A text chunk with no newline is kept as written. A chunk that contains a newline is trimmed and its line breaks collapse to a space. Whitespace-only chunks are dropped.
+
+Closing tags must match. `/>` closes without children. Spread attributes are not supported. Attributes require a value.
+
+`<` after an expression is still a comparison or a generic call (`id<number>(1)`), not JSX. See [dom.md](dom.md) for intrinsic tags, components, and `<each>`.
 
 Arrows are only `( ParamList ) =>` (Expr | Block). Params must be typed. `=> {` is always a block.
 

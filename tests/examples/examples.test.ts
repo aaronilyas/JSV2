@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { checkFile } from "../../src/checker/check.ts";
 import {
   mount,
+  renderToString,
   type MountNode,
   type MountParent,
   type Node,
@@ -22,6 +23,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const cliPath = join(root, "src", "cli.ts");
 const helloPath = join(root, "examples", "hello.jsv");
 const counterPath = join(root, "examples", "counter.jsv");
+const todosPath = join(root, "examples", "todos.jsv");
 
 type FakeEl = MountNode & {
   tag: string;
@@ -155,9 +157,10 @@ function createText(value: string): FakeEl {
   return el;
 }
 
-test("hello.jsv and counter.jsv typecheck clean", () => {
+test("hello.jsv, counter.jsv, and todos.jsv typecheck clean", () => {
   assert.equal(checkFile(helloPath).diagnostics.length, 0);
   assert.equal(checkFile(counterPath).diagnostics.length, 0);
+  assert.deepEqual(checkFile(todosPath).diagnostics, []);
 });
 
 test("jsv run examples/hello.jsv prints Ada then Bea", () => {
@@ -195,6 +198,68 @@ test("loadModule Counter mounts and updates in place", async () => {
     assert.equal(parent._children.find((c) => c.tag === "button"), btn);
   } finally {
     await cleanup();
+  }
+});
+
+test("loadModule TodoList renders rows", async () => {
+  const { namespace, cleanup } = await loadModule(todosPath);
+  try {
+    const TodoList = namespace.TodoList as () => Node;
+    assert.equal(renderToString(TodoList()), "<ul><li>one</li><li>two</li></ul>");
+    const parent = createFakeParent();
+    mount(parent, TodoList(), createElement, createText);
+    const ul = parent._children.find((c) => c.tag === "ul");
+    assert.ok(ul);
+    const labels = () =>
+      ul!._children
+        .filter((c) => c.tag === "li")
+        .map((li) => li._children.find((c) => c.nodeType === 3)?.textContent);
+    assert.deepEqual(labels(), ["one", "two"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("mounted each updates the text node for a kept key", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "jsv-each-"));
+  const file = join(dir, "rows.jsv");
+  writeFileSync(
+    file,
+    `import { signal, computed, Signal, Node } from "jsv/dom";
+type Row = { id: string; label: string; };
+export let rows = signal<Row[]>([{ id: "a", label: "one" }]);
+export function view(): Node {
+  return <ul>
+    <each items={rows} key={(row: Row) => row.id}>
+      {(row: Signal<Row>) => {
+        let label = computed<string>(() => { return row.get().label; });
+        return <li>{label}</li>;
+      }}
+    </each>
+  </ul>;
+}
+`,
+  );
+  const { namespace, cleanup } = await loadModule(file);
+  try {
+    const view = namespace.view as () => Node;
+    const rows = namespace.rows as {
+      set: (next: { id: string; label: string }[]) => void;
+    };
+    const parent = createFakeParent();
+    mount(parent, view(), createElement, createText);
+    const ul = parent._children.find((c) => c.tag === "ul");
+    assert.ok(ul);
+    const textOf = () =>
+      ul!._children
+        .find((c) => c.tag === "li")
+        ?._children.find((c) => c.nodeType === 3)?.textContent;
+    assert.equal(textOf(), "one");
+    rows.set([{ id: "a", label: "two" }]);
+    assert.equal(textOf(), "two");
+  } finally {
+    await cleanup();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

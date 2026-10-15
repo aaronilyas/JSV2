@@ -310,7 +310,27 @@ export type Expr =
       expression: Expr;
       type: TypeNode;
       span: Span;
+    }
+  | {
+      kind: "jsx";
+      /** null is a fragment (`<>...</>`). `"each"` is the keyed-list form. */
+      tag: string | null;
+      tagSpan: Span | null;
+      attributes: JsxAttribute[];
+      children: JsxChild[];
+      span: Span;
     };
+
+export type JsxAttribute = {
+  name: string;
+  nameSpan: Span;
+  value: Expr;
+  span: Span;
+};
+
+export type JsxChild =
+  | { kind: "text"; value: string; span: Span }
+  | { kind: "expr"; expr: Expr; span: Span };
 
 export type BinaryOp =
   | "||"
