@@ -10,6 +10,7 @@ import {
   typeAt,
 } from "../checker/check.ts";
 import { diagnosticsResult, type Diagnostic } from "../diagnostics.ts";
+import { completionsAt } from "./complete.ts";
 import { domAnalyze } from "./dom-analyze.ts";
 import { suggestFix } from "./fixes.ts";
 
@@ -143,10 +144,48 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
+    "complete",
+    {
+      description:
+        "Completions at a 1-based line/column: in-scope bindings, members after '.', or jsv/dom exports inside an import.",
+      inputSchema: z.object({
+        source: z.string().optional(),
+        path: z.string().optional(),
+        line: z.number().int(),
+        column: z.number().int(),
+      }),
+    },
+    (args) => {
+      const resolved = resolveSourceInput(args);
+      if (!resolved.ok) {
+        const caret = { line: args.line, column: args.column };
+        return textResult({
+          prefix: "",
+          replace: { start: caret, end: caret },
+          candidates: [],
+          diagnostics: [resolved.diagnostic],
+        });
+      }
+      const options = resolved.fromPath
+        ? undefined
+        : { readFile: () => null };
+      return textResult(
+        completionsAt(
+          resolved.source,
+          resolved.file,
+          args.line,
+          args.column,
+          options,
+        ),
+      );
+    },
+  );
+
+  server.registerTool(
     "suggestFix",
     {
       description:
-        "Suggest a text edit for a diagnostic at a position (semicolon insert only).",
+        "Suggest one unambiguous text edit for a diagnostic at a position. Returns applicable:false when the edit would be a guess.",
       inputSchema: z.object({
         source: z.string().optional(),
         path: z.string().optional(),
@@ -194,12 +233,13 @@ export function createServer(): McpServer {
     (args) => {
       const resolved = resolveSourceInput(args);
       if (!resolved.ok) {
+        // `issues` is DOM-only. Input failures belong in `diagnostics`.
         return textResult({
           signals: [],
           effects: [],
           lists: [],
-          issues: [resolved.diagnostic],
-          diagnostics: [],
+          issues: [],
+          diagnostics: [resolved.diagnostic],
         });
       }
       return textResult(domAnalyze(resolved.source, resolved.file));

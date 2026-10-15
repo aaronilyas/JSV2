@@ -54,6 +54,7 @@ test("MCP stdio server tools and exit on client close", async () => {
     const names = tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
       "check",
+      "complete",
       "domAnalyze",
       "suggestFix",
       "typeOf",
@@ -91,6 +92,22 @@ test("MCP stdio server tools and exit on client close", async () => {
     assert.equal(typeOf.found, true);
     assert.equal(typeOf.type, "number");
 
+    const complete = parseToolJson(
+      await client.callTool({
+        name: "complete",
+        arguments: {
+          source: 'import { signal } from "jsv/dom";\nlet s = signal<number>(0);\ns.get;\n',
+          line: 3,
+          column: 2,
+        },
+      }),
+    ) as { candidates: { name: string; kind: string }[] };
+    assert.deepEqual(
+      complete.candidates.map((c) => c.name),
+      ["get", "set", "update"],
+    );
+    assert.ok(complete.candidates.every((c) => c.kind === "member"));
+
     const fix = parseToolJson(
       await client.callTool({
         name: "suggestFix",
@@ -122,6 +139,20 @@ effect(() => {
     assert.ok(
       dom.issues.some((i) => i.code === "jsv.dom.effect_self_write"),
     );
+
+    const missingDom = parseToolJson(
+      await client.callTool({
+        name: "domAnalyze",
+        arguments: {},
+      }),
+    ) as {
+      issues: unknown[];
+      diagnostics: { code: string; message: string }[];
+    };
+    assert.deepEqual(missingDom.issues, []);
+    assert.equal(missingDom.diagnostics.length, 1);
+    assert.equal(missingDom.diagnostics[0]!.code, "jsv.mcp.missing_input");
+    assert.equal(missingDom.diagnostics[0]!.message, "Provide source or path.");
   } finally {
     await client.close();
   }
