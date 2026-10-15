@@ -240,6 +240,13 @@ export function createDomLibModule(): DomLibModule {
       ),
     ),
   );
+  namedValues.set(
+    "renderToString",
+    valueBinding(
+      "renderToString",
+      functionType([{ name: "node", type: nodeType }], prim("string")),
+    ),
+  );
 
   return {
     namedValues,

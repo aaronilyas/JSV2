@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { Diagnostic } from "../diagnostics.ts";
+import type { Diagnostic, SourcePosition } from "../diagnostics.ts";
 import { parse } from "../parser/parse.ts";
 import type {
   Block,
@@ -45,8 +45,53 @@ import {
   type TypeDef,
 } from "./types.ts";
 
+export type TypeArgHint = {
+  /** Diagnostic start (1-based). */
+  line: number;
+  column: number;
+  /** Inferred type-argument strings, in parameter order. */
+  args: string[];
+};
+
+export type BindingOrigin =
+  | "local"
+  | "param"
+  | "import"
+  | "declaration"
+  | "ambient";
+
+export type CapturedBinding = {
+  name: string;
+  kind: "value" | "type" | "both";
+  origin: BindingOrigin;
+  type: string;
+};
+
+export type CompletionCapture = {
+  line: number;
+  column: number;
+  source: string;
+  scopeBest: { extent: number; bindings: CapturedBinding[] } | null;
+  memberBest: {
+    extent: number;
+    objectType: Type;
+    propertySpan: Span;
+  } | null;
+};
+
 export type CheckOptions = {
   readFile?: (absolutePath: string) => string | null;
+  /** When set, typecheck even if the parse produced diagnostics. */
+  typecheckPartial?: boolean;
+  /** Filled with unambiguous call/annotation type-argument inferences. */
+  typeArgHints?: TypeArgHint[];
+  /** Filled with the scope (and member receiver) at line/column. */
+  completion?: CompletionCapture;
+  typeQuery?: {
+    line: number;
+    column: number;
+    hits: { span: Span; type: Type }[];
+  };
 };
 
 type BindingKind = "value" | "type" | "both";
@@ -54,6 +99,7 @@ type BindingKind = "value" | "type" | "both";
 type Binding = {
   name: string;
   kind: BindingKind;
+  origin: BindingOrigin;
   mutable: boolean;
   valueType: Type;
   typeDef?: TypeDef;
@@ -86,6 +132,13 @@ type CheckerContext = {
   returnType: Type | null;
   thisType: Type | null;
   inExprStmt: boolean;
+  typeArgHints?: TypeArgHint[];
+  completion?: CompletionCapture;
+  typeQuery?: {
+    line: number;
+    column: number;
+    hits: { span: Span; type: Type }[];
+  };
 };
 
 function defaultReadFile(absolutePath: string): string | null {
@@ -143,21 +196,82 @@ function lookupValueType(ctx: CheckerContext, name: string): Type | null {
   return b.valueType;
 }
 
+function originForScope(ctx: CheckerContext): BindingOrigin {
+  if (ctx.scope.parent === null) return "ambient";
+  if (ctx.scope.parent.parent === null) return "declaration";
+  return "local";
+}
+
 function declareInScope(
   ctx: CheckerContext,
-  binding: Binding,
+  binding: Omit<Binding, "origin"> & { origin?: BindingOrigin },
   span: Span,
 ): void {
-  if (ctx.scope.bindings.has(binding.name)) {
+  const full: Binding = {
+    ...binding,
+    origin: binding.origin ?? originForScope(ctx),
+  };
+  if (ctx.scope.bindings.has(full.name)) {
     diag(
       ctx,
       "jsv.check.duplicate_declaration",
-      `Duplicate declaration of '${binding.name}'.`,
+      `Duplicate declaration of '${full.name}'.`,
       span,
     );
     return;
   }
-  ctx.scope.bindings.set(binding.name, binding);
+  ctx.scope.bindings.set(full.name, full);
+}
+
+function typeBindingLabel(binding: Binding): string {
+  const def = binding.typeDef;
+  if (def === undefined) return binding.name;
+  if (def.typeParams.length === 0) return def.name;
+  return `${def.name}<${def.typeParams.join(", ")}>`;
+}
+
+function snapshotBindings(ctx: CheckerContext): CapturedBinding[] {
+  const out: CapturedBinding[] = [];
+  const seen = new Set<string>();
+  let scope: Scope | null = ctx.scope;
+  while (scope !== null) {
+    for (const binding of scope.bindings.values()) {
+      if (seen.has(binding.name)) continue;
+      seen.add(binding.name);
+      const narrowed = ctx.narrowing.get(binding.name);
+      out.push({
+        name: binding.name,
+        kind: binding.kind,
+        origin: binding.origin,
+        type:
+          binding.kind === "type"
+            ? typeBindingLabel(binding)
+            : typeToString(narrowed ?? binding.valueType),
+      });
+    }
+    scope = scope.parent;
+  }
+  return out;
+}
+
+function captureScope(ctx: CheckerContext, span: Span): void {
+  const cap = ctx.completion;
+  if (cap === undefined) return;
+  if (!containsPosition(span, cap.line, cap.column)) return;
+  const extent = spanExtent(cap.source, span);
+  const bindings = snapshotBindings(ctx);
+  if (cap.scopeBest === null || extent <= cap.scopeBest.extent) {
+    cap.scopeBest = { extent, bindings };
+  }
+}
+
+function endsBeforeCursor(ctx: CheckerContext, span: Span): boolean {
+  const cap = ctx.completion;
+  if (cap === undefined) return false;
+  return (
+    span.end.line < cap.line ||
+    (span.end.line === cap.line && span.end.column < cap.column)
+  );
 }
 
 function consoleType(): Type {
@@ -231,6 +345,18 @@ function resolveTypeNode(
   ctx: CheckerContext,
   node: TypeNode,
   typeParamNames: Set<string> = new Set(),
+): Type {
+  const type = resolveTypeNodeBody(ctx, node, typeParamNames);
+  if (ctx.typeQuery !== undefined) {
+    ctx.typeQuery.hits.push({ span: node.span, type });
+  }
+  return type;
+}
+
+function resolveTypeNodeBody(
+  ctx: CheckerContext,
+  node: TypeNode,
+  typeParamNames: Set<string>,
 ): Type {
   switch (node.kind) {
     case "prim":
@@ -386,12 +512,19 @@ function checkModule(
   readFile: (absolutePath: string) => string | null,
   moduleCache: Map<string, ModuleResult>,
   checkingStack: Set<string>,
+  typeQuery?: CheckOptions["typeQuery"],
+  extras?: {
+    typecheckPartial?: boolean;
+    typeArgHints?: TypeArgHint[];
+    completion?: CompletionCapture;
+  },
 ): ModuleResult {
   const cached = moduleCache.get(absolutePath);
   if (cached !== undefined) return cached;
 
   const { program, diagnostics: parseDiags } = parse(source, absolutePath);
-  if (parseDiags.length > 0) {
+  const partial = extras?.typecheckPartial === true;
+  if (parseDiags.length > 0 && !partial) {
     const result = emptyModule(true);
     result.diagnostics = parseDiags;
     moduleCache.set(absolutePath, result);
@@ -405,6 +538,8 @@ function checkModule(
     readFile,
     moduleCache,
     checkingStack,
+    typeArgHints: extras?.typeArgHints,
+    completion: extras?.completion,
     scope: {
       bindings: new Map(),
       parent: {
@@ -414,6 +549,7 @@ function checkModule(
             {
               name: "console",
               kind: "value" as const,
+              origin: "ambient",
               mutable: false,
               valueType: consoleType(),
             },
@@ -426,6 +562,7 @@ function checkModule(
     returnType: null,
     thisType: null,
     inExprStmt: false,
+    typeQuery,
   };
 
   // Imports first so imported types are in scope for hoisted signatures.
@@ -435,13 +572,18 @@ function checkModule(
 
   hoistDeclarations(ctx, program);
 
+  captureScope(ctx, program.span);
   for (const stmt of program.body) {
     if (stmt.kind === "import") continue;
     checkStatement(ctx, stmt);
+    if (endsBeforeCursor(ctx, stmt.span)) captureScope(ctx, program.span);
   }
 
   const result = collectExports(ctx, program);
-  result.diagnostics = ctx.diagnostics;
+  result.diagnostics =
+    parseDiags.length > 0
+      ? [...parseDiags, ...ctx.diagnostics]
+      : ctx.diagnostics;
   checkingStack.delete(absolutePath);
   moduleCache.set(absolutePath, result);
   return result;
@@ -746,6 +888,7 @@ function checkImport(
         {
           name: stmt.defaultName,
           kind: "value",
+          origin: "import",
           mutable: false,
           valueType: ERROR_TYPE,
         },
@@ -758,6 +901,7 @@ function checkImport(
         {
           name: stmt.defaultName,
           kind: exp.kind,
+          origin: "import",
           mutable: false,
           valueType: exp.valueType,
           typeDef: exp.typeDef,
@@ -780,6 +924,7 @@ function checkImport(
         {
           name: name.local,
           kind: "value",
+          origin: "import",
           mutable: false,
           valueType: ERROR_TYPE,
         },
@@ -801,6 +946,7 @@ function checkImport(
         {
           name: name.local,
           kind: "value",
+          origin: "import",
           mutable: false,
           valueType: ERROR_TYPE,
         },
@@ -814,6 +960,7 @@ function checkImport(
         {
           name: name.local,
           kind: "both",
+          origin: "import",
           mutable: false,
           valueType: valueExp.valueType,
           typeDef: typeExp.typeDef ?? valueExp.typeDef,
@@ -826,6 +973,7 @@ function checkImport(
         {
           name: name.local,
           kind: valueExp.kind === "both" ? "both" : "value",
+          origin: "import",
           mutable: false,
           valueType: valueExp.valueType,
           typeDef: valueExp.typeDef,
@@ -838,6 +986,7 @@ function checkImport(
         {
           name: name.local,
           kind: "type",
+          origin: "import",
           mutable: false,
           valueType: ERROR_TYPE,
           typeDef: typeExp.typeDef,
@@ -851,6 +1000,7 @@ function checkImport(
 // --- Statements -------------------------------------------------------------
 
 function checkStatement(ctx: CheckerContext, stmt: Statement): boolean {
+  captureScope(ctx, stmt.span);
   switch (stmt.kind) {
     case "import":
       checkImport(ctx, stmt);
@@ -898,9 +1048,11 @@ function checkStatement(ctx: CheckerContext, stmt: Statement): boolean {
 
 function checkBlock(ctx: CheckerContext, block: Block): boolean {
   pushScope(ctx);
+  captureScope(ctx, block.span);
   let returns = false;
   for (const s of block.body) {
     if (checkStatement(ctx, s)) returns = true;
+    if (endsBeforeCursor(ctx, s.span)) captureScope(ctx, block.span);
   }
   popScope(ctx);
   return returns;
@@ -937,6 +1089,21 @@ function checkVar(ctx: CheckerContext, stmt: VarStmt): void {
   if (declaredType !== null) {
     checkAssignability(ctx, initType, declaredType, stmt.init.span);
   }
+  if (
+    stmt.type !== null &&
+    stmt.type.kind === "named" &&
+    stmt.type.args.length === 0
+  ) {
+    const named = lookupBinding(ctx, stmt.type.name);
+    if (named?.typeDef !== undefined) {
+      recordTypeArgHint(
+        ctx,
+        stmt.type.span.start.line,
+        stmt.type.span.start.column,
+        inferTypeArgsFromValue(named.typeDef, initType),
+      );
+    }
+  }
 
   declareInScope(
     ctx,
@@ -962,6 +1129,7 @@ function bindTypeParams(
       {
         name: tp.name,
         kind: "type",
+        origin: "param",
         mutable: false,
         valueType: ERROR_TYPE,
         typeDef: {
@@ -985,12 +1153,14 @@ function checkFunctionBody(ctx: CheckerContext, stmt: FunctionDecl): void {
       {
         name: p.name,
         kind: "value",
+        origin: "param",
         mutable: true,
         valueType: resolveTypeNode(ctx, p.type, tpSet),
       },
       p.nameSpan,
     );
   }
+  captureScope(ctx, stmt.span);
   const returnType = resolveTypeNode(ctx, stmt.returnType, tpSet);
   const prevRet = ctx.returnType;
   ctx.returnType = returnType;
@@ -1025,12 +1195,14 @@ function checkClassBodies(ctx: CheckerContext, stmt: ClassDecl): void {
           {
             name: p.name,
             kind: "value",
+            origin: "param",
             mutable: true,
             valueType: resolveTypeNode(ctx, p.type),
           },
           p.nameSpan,
         );
       }
+      captureScope(ctx, m.span);
       const prevThis = ctx.thisType;
       const prevRet = ctx.returnType;
       ctx.thisType = instance;
@@ -1048,12 +1220,14 @@ function checkClassBodies(ctx: CheckerContext, stmt: ClassDecl): void {
           {
             name: p.name,
             kind: "value",
+            origin: "param",
             mutable: true,
             valueType: resolveTypeNode(ctx, p.type, tpSet),
           },
           p.nameSpan,
         );
       }
+      captureScope(ctx, m.span);
       const returnType = resolveTypeNode(ctx, m.returnType, tpSet);
       const prevThis = ctx.thisType;
       const prevRet = ctx.returnType;
@@ -1309,6 +1483,19 @@ function tryTypeofNarrow(
 // --- Expressions ------------------------------------------------------------
 
 function checkExpr(
+  ctx: CheckerContext,
+  expr: Expr,
+  expected: Type | null,
+): Type {
+  captureScope(ctx, expr.span);
+  const type = checkExprBody(ctx, expr, expected);
+  if (ctx.typeQuery !== undefined) {
+    ctx.typeQuery.hits.push({ span: expr.span, type });
+  }
+  return type;
+}
+
+function checkExprBody(
   ctx: CheckerContext,
   expr: Expr,
   expected: Type | null,
@@ -1787,6 +1974,210 @@ function checkTernary(
   return unionType([ct, at]);
 }
 
+function containsSolvedParam(type: Type, solving: Set<string>): boolean {
+  switch (type.kind) {
+    case "prim":
+    case "error":
+      return false;
+    case "type_param":
+      return solving.has(type.name);
+    case "array":
+      return containsSolvedParam(type.element, solving);
+    case "union":
+      return type.members.some((m) => containsSolvedParam(m, solving));
+    case "object":
+      return type.props.some((p) => containsSolvedParam(p.type, solving));
+    case "function": {
+      const inner = new Set(solving);
+      for (const tp of type.typeParams) inner.delete(tp);
+      return (
+        type.params.some((p) => containsSolvedParam(p.type, inner)) ||
+        containsSolvedParam(type.returnType, inner)
+      );
+    }
+    case "ref":
+      return type.args.some((a) => containsSolvedParam(a, solving));
+    default: {
+      const _exhaustive: never = type;
+      return _exhaustive;
+    }
+  }
+}
+
+function typesEqual(a: Type, b: Type): boolean {
+  if (a === b) return true;
+  const left = unwrap(a);
+  const right = unwrap(b);
+  if (left === right) return true;
+  if (left.kind !== right.kind) return false;
+  switch (left.kind) {
+    case "prim":
+      return right.kind === "prim" && left.name === right.name;
+    case "error":
+      return false;
+    case "type_param":
+      return right.kind === "type_param" && left.name === right.name;
+    case "array":
+      return right.kind === "array" && typesEqual(left.element, right.element);
+    case "union":
+      return (
+        right.kind === "union" &&
+        left.members.length === right.members.length &&
+        left.members.every((m, i) => typesEqual(m, right.members[i]!))
+      );
+    case "object": {
+      if (right.kind !== "object" || left.props.length !== right.props.length) {
+        return false;
+      }
+      return left.props.every((p) => {
+        const other = right.props.find((x) => x.name === p.name);
+        return (
+          other !== undefined &&
+          p.optional === other.optional &&
+          typesEqual(p.type, other.type)
+        );
+      });
+    }
+    case "function":
+      if (right.kind !== "function") return false;
+      if (left.typeParams.length > 0 || right.typeParams.length > 0) return false;
+      if (left.params.length !== right.params.length) return false;
+      return (
+        left.params.every((p, i) => typesEqual(p.type, right.params[i]!.type)) &&
+        typesEqual(left.returnType, right.returnType)
+      );
+    case "ref":
+      if (right.kind !== "ref") return false;
+      return (
+        left.def === right.def &&
+        left.args.length === right.args.length &&
+        left.args.every((arg, i) => typesEqual(arg, right.args[i]!))
+      );
+    default: {
+      const _exhaustive: never = left;
+      return _exhaustive;
+    }
+  }
+}
+
+function inferBind(
+  param: Type,
+  arg: Type,
+  env: Map<string, Type>,
+  solving: Set<string>,
+): boolean {
+  if (param.kind === "type_param" && solving.has(param.name)) {
+    if (arg.kind === "error") return false;
+    if (containsSolvedParam(arg, solving)) return false;
+    const prev = env.get(param.name);
+    if (prev === undefined) {
+      env.set(param.name, arg);
+      return true;
+    }
+    return typesEqual(prev, arg);
+  }
+  if (!containsSolvedParam(param, solving)) return true;
+
+  const left = unwrap(param);
+  const right = unwrap(arg);
+  if (left.kind === "type_param" && solving.has(left.name)) {
+    return inferBind(left, right, env, solving);
+  }
+  if (right.kind === "error") return false;
+  if (left.kind === "array" && right.kind === "array") {
+    return inferBind(left.element, right.element, env, solving);
+  }
+  if (left.kind === "function" && right.kind === "function") {
+    if (left.typeParams.length > 0 || right.typeParams.length > 0) return false;
+    if (left.params.length !== right.params.length) return false;
+    for (let i = 0; i < left.params.length; i++) {
+      const lp = left.params[i];
+      const rp = right.params[i];
+      if (lp === undefined || rp === undefined) return false;
+      if (!inferBind(lp.type, rp.type, env, solving)) return false;
+    }
+    return inferBind(left.returnType, right.returnType, env, solving);
+  }
+  if (left.kind === "object" && right.kind === "object") {
+    for (const prop of left.props) {
+      if (!containsSolvedParam(prop.type, solving)) continue;
+      const found = right.props.find((x) => x.name === prop.name);
+      if (found === undefined) return false;
+      if (!inferBind(prop.type, found.type, env, solving)) return false;
+    }
+    return true;
+  }
+  if (left.kind === "ref" && right.kind === "ref" && left.def === right.def) {
+    if (left.args.length !== right.args.length) return false;
+    for (let i = 0; i < left.args.length; i++) {
+      const la = left.args[i];
+      const ra = right.args[i];
+      if (la === undefined || ra === undefined) return false;
+      if (!inferBind(la, ra, env, solving)) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function solvedArgs(
+  names: readonly string[],
+  env: Map<string, Type>,
+): string[] | null {
+  const args: string[] = [];
+  for (const name of names) {
+    const type = env.get(name);
+    if (type === undefined) return null;
+    args.push(typeToString(type));
+  }
+  return args;
+}
+
+function inferCallTypeArgs(
+  fn: Extract<Type, { kind: "function" }>,
+  argTypes: Type[],
+): string[] | null {
+  if (fn.typeParams.length === 0 || fn.anyArity === true) return null;
+  if (argTypes.length !== fn.params.length) return null;
+  const solving = new Set(fn.typeParams);
+  const env = new Map<string, Type>();
+  for (let i = 0; i < fn.params.length; i++) {
+    const param = fn.params[i];
+    const arg = argTypes[i];
+    if (param === undefined || arg === undefined) return null;
+    if (!inferBind(param.type, arg, env, solving)) return null;
+  }
+  return solvedArgs(fn.typeParams, env);
+}
+
+function inferTypeArgsFromValue(def: TypeDef, value: Type): string[] | null {
+  if (def.typeParams.length === 0 || value.kind === "error") return null;
+  const solving = new Set(def.typeParams);
+  if (
+    value.kind === "ref" &&
+    value.def === def &&
+    value.args.length === def.typeParams.length &&
+    value.args.every(
+      (a) => a.kind !== "error" && !containsSolvedParam(a, solving),
+    )
+  ) {
+    return value.args.map((a) => typeToString(a));
+  }
+  const env = new Map<string, Type>();
+  if (!inferBind(def.body, value, env, solving)) return null;
+  return solvedArgs(def.typeParams, env);
+}
+
+function recordTypeArgHint(
+  ctx: CheckerContext,
+  line: number,
+  column: number,
+  args: string[] | null,
+): void {
+  if (ctx.typeArgHints === undefined || args === null) return;
+  ctx.typeArgHints.push({ line, column, args });
+}
+
 function checkCall(
   ctx: CheckerContext,
   expr: Extract<Expr, { kind: "call" }>,
@@ -1816,7 +2207,14 @@ function checkCall(
         "Generic function requires type arguments.",
         expr.callee.span,
       );
-      for (const a of expr.args) checkExpr(ctx, a, null);
+      const argTypes: Type[] = [];
+      for (const a of expr.args) argTypes.push(checkExpr(ctx, a, null));
+      recordTypeArgHint(
+        ctx,
+        expr.callee.span.start.line,
+        expr.callee.span.start.column,
+        inferCallTypeArgs(fn, argTypes),
+      );
       return ERROR_TYPE;
     }
     if (expr.typeArgs.length !== fn.typeParams.length) {
@@ -1882,11 +2280,45 @@ function checkCall(
   return returnType;
 }
 
+function memberCursor(
+  expr: Extract<Expr, { kind: "member" }>,
+  line: number,
+  column: number,
+): boolean {
+  if (containsPosition(expr.propertySpan, line, column)) return true;
+  const end = expr.object.span.end;
+  const start = expr.propertySpan.start;
+  const afterObject =
+    line > end.line || (line === end.line && column > end.column);
+  const beforeProperty =
+    line < start.line || (line === start.line && column < start.column);
+  return afterObject && beforeProperty;
+}
+
+function noteMember(
+  ctx: CheckerContext,
+  expr: Extract<Expr, { kind: "member" }>,
+  objectType: Type,
+): void {
+  const cap = ctx.completion;
+  if (cap === undefined) return;
+  if (!memberCursor(expr, cap.line, cap.column)) return;
+  const extent = spanExtent(cap.source, expr.propertySpan);
+  if (cap.memberBest === null || extent < cap.memberBest.extent) {
+    cap.memberBest = {
+      extent,
+      objectType,
+      propertySpan: expr.propertySpan,
+    };
+  }
+}
+
 function checkMember(
   ctx: CheckerContext,
   expr: Extract<Expr, { kind: "member" }>,
 ): Type {
   const objType = checkExpr(ctx, expr.object, null);
+  noteMember(ctx, expr, objType);
   const prop = getProperty(objType, expr.property);
   if (prop === null) {
     if (objType.kind === "error") return ERROR_TYPE;
@@ -2040,6 +2472,7 @@ function checkArrow(
       {
         name: p.name,
         kind: "value",
+        origin: "param",
         mutable: true,
         valueType: pType,
       },
@@ -2047,6 +2480,7 @@ function checkArrow(
     );
     params.push({ name: p.name, type: pType });
   }
+  captureScope(ctx, expr.span);
 
   let returnType: Type;
   if (expr.body.kind === "block") {
@@ -2118,7 +2552,19 @@ export function checkSource(
   const absolute = resolve(file);
   const moduleCache = new Map<string, ModuleResult>();
   const checkingStack = new Set<string>();
-  checkModule(absolute, source, readFile, moduleCache, checkingStack);
+  checkModule(
+    absolute,
+    source,
+    readFile,
+    moduleCache,
+    checkingStack,
+    options?.typeQuery,
+    {
+      typecheckPartial: options?.typecheckPartial === true,
+      typeArgHints: options?.typeArgHints,
+      completion: options?.completion,
+    },
+  );
   return { diagnostics: gatherDiagnostics(moduleCache, absolute) };
 }
 
@@ -2141,5 +2587,92 @@ export function checkFile(
       ],
     };
   }
-  return checkSource(source, absolute, { readFile });
+  return checkSource(source, absolute, { ...options, readFile });
+}
+
+export type TypeHit = {
+  type: string;
+  start: SourcePosition;
+  end: SourcePosition;
+};
+
+function containsPosition(
+  span: Span,
+  line: number,
+  column: number,
+): boolean {
+  const afterStart =
+    line > span.start.line ||
+    (line === span.start.line && column >= span.start.column);
+  const beforeEnd =
+    line < span.end.line ||
+    (line === span.end.line && column <= span.end.column);
+  return afterStart && beforeEnd;
+}
+
+/** UTF-16 code-unit offset of a 1-based line/column position. */
+function positionOffset(source: string, pos: SourcePosition): number {
+  let line = 1;
+  let column = 1;
+  for (let i = 0; i < source.length; i++) {
+    if (line === pos.line && column === pos.column) return i;
+    if (source.charCodeAt(i) === 10) {
+      line += 1;
+      column = 1;
+    } else {
+      column += 1;
+    }
+  }
+  if (line === pos.line && column === pos.column) return source.length;
+  return source.length;
+}
+
+function spanExtent(source: string, span: Span): number {
+  return positionOffset(source, span.end) - positionOffset(source, span.start);
+}
+
+export function typeAt(
+  source: string,
+  file: string,
+  line: number,
+  column: number,
+  options?: CheckOptions,
+): { hit: TypeHit | null; diagnostics: Diagnostic[] } {
+  const hits: { span: Span; type: Type }[] = [];
+  const typeQuery = { line, column, hits };
+  const { diagnostics } = checkSource(source, file, {
+    ...options,
+    typeQuery,
+  });
+
+  const containing = hits.filter((h) => containsPosition(h.span, line, column));
+  if (containing.length === 0) {
+    return { hit: null, diagnostics };
+  }
+
+  const hasNonError = containing.some((h) => h.type.kind !== "error");
+  const candidates = hasNonError
+    ? containing.filter((h) => h.type.kind !== "error")
+    : containing;
+
+  // Prefer smallest extent; on a tie prefer the earlier hit (inner node).
+  let best = candidates[0]!;
+  let bestExtent = spanExtent(source, best.span);
+  for (let i = 1; i < candidates.length; i++) {
+    const h = candidates[i]!;
+    const extent = spanExtent(source, h.span);
+    if (extent < bestExtent) {
+      best = h;
+      bestExtent = extent;
+    }
+  }
+
+  return {
+    hit: {
+      type: typeToString(best.type),
+      start: best.span.start,
+      end: best.span.end,
+    },
+    diagnostics,
+  };
 }

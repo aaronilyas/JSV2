@@ -4,6 +4,8 @@ Import from the ambient specifier `jsv/dom` (checker) or `src/runtime` (TypeScri
 
 Components are plain functions that return a `Node`. There is no component class, no JSX, and no whole-tree virtual DOM diff on every event. Updates are fine-grained: one text node, one attribute, or a keyed list row.
 
+`.jsv` programs may import values `signal`, `computed`, `effect`, `text`, `h`, `fragment`, `list`, and `renderToString` from `jsv/dom`. Types `Node`, `Signal`, `Computed`, and `DomProps` are type-only. `mount` is a host API (TypeScript / tests), not part of the `.jsv` surface.
+
 ## API
 
 ```ts
