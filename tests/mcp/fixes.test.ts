@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { checkSource } from "../../src/checker/check.ts";
+import { domAnalyze } from "../../src/mcp/dom-analyze.ts";
 import { suggestFix } from "../../src/mcp/fixes.ts";
 import type { SourcePosition } from "../../src/diagnostics.ts";
 
@@ -384,4 +385,355 @@ test("suggestFix not applicable for unknown code", () => {
   assert.equal(result.applicable, false);
   assert.equal(result.edits.length, 0);
   assert.match(result.message, /No matching diagnostic|not auto-fixable/);
+});
+
+function fixAt(
+  source: string,
+  code: string,
+): { applicable: boolean; edits: { start: SourcePosition; end: SourcePosition; newText: string }[]; message: string } {
+  const diagnostic = checkSource(source, "t.jsv").diagnostics.find((item) => item.code === code);
+  assert.ok(diagnostic?.start, source);
+  return suggestFix(source, "t.jsv", code, diagnostic.start.line, diagnostic.start.column);
+}
+
+test("suggestFix reads a signal or computed with .get()", () => {
+  const source = `import { signal, computed } from "jsv/dom";
+let count = signal<number>(0);
+let label = computed<string>(() => { return "n"; });
+let n: number = count;
+let s: string = label;
+`;
+  const countFix = fixAt(source, "jsv.check.not_assignable");
+  assert.equal(countFix.applicable, true);
+  assert.equal(countFix.edits[0]!.newText, ".get()");
+  const once = applyEdits(source, countFix.edits);
+  const labelDiag = checkSource(once, "t.jsv").diagnostics.find(
+    (item) => item.code === "jsv.check.not_assignable",
+  );
+  assert.ok(labelDiag?.start);
+  const labelFix = suggestFix(
+    once,
+    "t.jsv",
+    "jsv.check.not_assignable",
+    labelDiag.start.line,
+    labelDiag.start.column,
+  );
+  assert.equal(labelFix.edits[0]!.newText, ".get()");
+  assert.equal(checkSource(applyEdits(once, labelFix.edits), "t.jsv").diagnostics.length, 0);
+
+  const mismatch = `import { signal } from "jsv/dom";
+let count = signal<number>(0);
+let s: string = count;
+`;
+  assert.equal(fixAt(mismatch, "jsv.check.not_assignable").applicable, false);
+});
+
+test("suggestFix calls .get and wraps signal operands", () => {
+  const forgotten = `import { signal } from "jsv/dom";
+let count = signal<number>(0);
+let n: number = count.get;
+`;
+  const call = fixAt(forgotten, "jsv.check.not_assignable");
+  assert.equal(call.applicable, true);
+  assert.equal(call.edits[0]!.newText, "()");
+  assert.equal(checkSource(applyEdits(forgotten, call.edits), "t.jsv").diagnostics.length, 0);
+
+  const added = `import { signal } from "jsv/dom";
+let count = signal<number>(0);
+let n: number = count + 1;
+`;
+  const op = fixAt(added, "jsv.check.bad_operator");
+  assert.equal(op.applicable, true);
+  assert.equal(op.edits[0]!.newText, ".get()");
+  assert.match(applyEdits(added, op.edits), /count\.get\(\) \+ 1/);
+  assert.equal(checkSource(applyEdits(added, op.edits), "t.jsv").diagnostics.length, 0);
+
+  const flag = `import { signal } from "jsv/dom";
+let flag = signal<boolean>(true);
+if (flag) { let x: number = 1; }
+`;
+  const cond = fixAt(flag, "jsv.check.condition_not_boolean");
+  assert.equal(cond.applicable, true);
+  assert.match(applyEdits(flag, cond.edits), /if \(flag\.get\(\)\)/);
+
+  const numberFlag = `import { signal } from "jsv/dom";
+let count = signal<number>(0);
+if (count) { let x: number = 1; }
+`;
+  assert.equal(fixAt(numberFlag, "jsv.check.condition_not_boolean").applicable, false);
+});
+
+test("suggestFix casts unknown and converts unambiguous literals", () => {
+  const unknown = `let u: unknown = 1;
+let s: string = u;
+`;
+  const cast = fixAt(unknown, "jsv.check.not_assignable");
+  assert.equal(cast.applicable, true);
+  assert.equal(cast.edits[0]!.newText, "u as string");
+  assert.equal(checkSource(applyEdits(unknown, cast.edits), "t.jsv").diagnostics.length, 0);
+
+  const textCall = `import { text } from "jsv/dom";
+text(1);
+`;
+  const literal = fixAt(textCall, "jsv.check.not_assignable");
+  assert.equal(literal.applicable, true);
+  assert.equal(literal.edits[0]!.newText, '"1"');
+  assert.equal(checkSource(applyEdits(textCall, literal.edits), "t.jsv").diagnostics.length, 0);
+
+  const numeric = `function takes(x: number): void { return; }
+takes("1");
+`;
+  const num = fixAt(numeric, "jsv.check.not_assignable");
+  assert.equal(num.edits[0]!.newText, "1");
+  assert.equal(checkSource(applyEdits(numeric, num.edits), "t.jsv").diagnostics.length, 0);
+
+  const padded = `function takes(x: number): void { return; }
+takes("01");
+`;
+  assert.equal(fixAt(padded, "jsv.check.not_assignable").applicable, false);
+});
+
+test("suggestFix writes a signal with set and relaxes a plain const", () => {
+  const signal = `import { signal } from "jsv/dom";
+const count = signal<number>(0);
+count = 1;
+`;
+  const set = fixAt(signal, "jsv.check.assign_const");
+  assert.equal(set.applicable, true);
+  assert.equal(set.edits[0]!.newText, "count.set(1)");
+  assert.equal(checkSource(applyEdits(signal, set.edits), "t.jsv").diagnostics.length, 0);
+
+  const plain = `const n: number = 1;
+n = 2;
+`;
+  const letFix = fixAt(plain, "jsv.check.assign_const");
+  assert.equal(letFix.applicable, true);
+  assert.equal(letFix.edits[0]!.newText, "let");
+  assert.equal(checkSource(applyEdits(plain, letFix.edits), "t.jsv").diagnostics.length, 0);
+
+  const wrong = `const n: number = 1;
+n = "a";
+`;
+  assert.equal(fixAt(wrong, "jsv.check.assign_const").applicable, false);
+});
+
+test("suggestFix renames a uniquely close property", () => {
+  const source = `import { signal } from "jsv/dom";
+let count = signal<number>(0);
+count.st(1);
+`;
+  const result = fixAt(source, "jsv.check.missing_property");
+  assert.equal(result.applicable, true);
+  assert.equal(result.edits[0]!.newText, "set");
+  assert.equal(checkSource(applyEdits(source, result.edits), "t.jsv").diagnostics.length, 0);
+
+  const tied = `let o: { a: number; b: number; } = { a: 1, b: 2 };
+o.c;
+`;
+  assert.equal(fixAt(tied, "jsv.check.missing_property").applicable, false);
+});
+
+test("suggestFix inserts return and a required return type", () => {
+  const missing = `function f(): number { 1; }
+`;
+  const ret = fixAt(missing, "jsv.check.missing_return");
+  assert.equal(ret.applicable, true);
+  assert.equal(ret.edits[0]!.newText, "return ");
+  assert.match(applyEdits(missing, ret.edits), /return 1;/);
+  assert.equal(checkSource(applyEdits(missing, ret.edits), "t.jsv").diagnostics.length, 0);
+
+  const busy = `function f(): number {
+  let x: number = 1;
+  x;
+}
+`;
+  assert.equal(fixAt(busy, "jsv.check.missing_return").applicable, false);
+
+  const untyped = `function f() { return 1; }
+`;
+  const diag = checkSource(untyped, "t.jsv").diagnostics.find(
+    (item) => item.message === "function return type is required",
+  );
+  assert.ok(diag?.start);
+  const typed = suggestFix(
+    untyped,
+    "t.jsv",
+    "jsv.parse.unexpected_token",
+    diag.start.line,
+    diag.start.column,
+  );
+  assert.equal(typed.applicable, true);
+  assert.equal(typed.edits[0]!.newText, ": number ");
+  assert.equal(checkSource(applyEdits(untyped, typed.edits), "t.jsv").diagnostics.length, 0);
+
+  const empty = `function f() { }
+`;
+  const emptyDiag = checkSource(empty, "t.jsv").diagnostics.find(
+    (item) => item.message === "function return type is required",
+  );
+  assert.ok(emptyDiag?.start);
+  const voidFix = suggestFix(
+    empty,
+    "t.jsv",
+    "jsv.parse.unexpected_token",
+    emptyDiag.start.line,
+    emptyDiag.start.column,
+  );
+  assert.equal(voidFix.edits[0]!.newText, ": void ");
+
+  const conflict = `function f() { return 1; return "a"; }
+`;
+  const conflictDiag = checkSource(conflict, "t.jsv").diagnostics.find(
+    (item) => item.message === "function return type is required",
+  );
+  assert.ok(conflictDiag?.start);
+  assert.equal(
+    suggestFix(
+      conflict,
+      "t.jsv",
+      "jsv.parse.unexpected_token",
+      conflictDiag.start.line,
+      conflictDiag.start.column,
+    ).applicable,
+    false,
+  );
+});
+
+test("suggestFix removes unexpected type arguments", () => {
+  const source = `function id(x: number): number { return x; }
+id<number>(1);
+`;
+  const result = fixAt(source, "jsv.check.unexpected_type_arguments");
+  assert.equal(result.applicable, true);
+  assert.equal(result.edits[0]!.newText, "");
+  assert.match(applyEdits(source, result.edits), /id\(1\)/);
+  assert.equal(checkSource(applyEdits(source, result.edits), "t.jsv").diagnostics.length, 0);
+});
+
+test("suggestFix does not insert a semicolon in the middle of a declaration", () => {
+  const source = "let x number = 1;";
+  const diag = checkSource(source, "t.jsv").diagnostics.find(
+    (item) => item.code === "jsv.parse.unexpected_token",
+  );
+  assert.ok(diag?.start);
+  const result = suggestFix(
+    source,
+    "t.jsv",
+    "jsv.parse.unexpected_token",
+    diag.start.line,
+    diag.start.column,
+  );
+  assert.equal(result.applicable, false);
+  assert.equal(result.edits.length, 0);
+});
+
+test("suggestFix imports a mistyped jsv/dom name when it is unique", () => {
+  const source = "signl<number>(0);\n";
+  const result = fixAt(source, "jsv.check.unresolved_name");
+  assert.equal(result.applicable, true);
+  const fixed = applyEdits(source, result.edits);
+  assert.match(fixed, /import \{ signal \} from "jsv\/dom"/);
+  assert.match(fixed, /signal<number>\(0\)/);
+  assert.equal(checkSource(fixed, "t.jsv").diagnostics.length, 0);
+
+  const tied = "let signa: number = 1;\nsignl;\n";
+  assert.equal(fixAt(tied, "jsv.check.unresolved_name").applicable, false);
+});
+
+test("suggestFix turns a pure deriving effect into computed", () => {
+  const source = `import { signal, effect } from "jsv/dom";
+let count = signal<number>(0);
+let doubled = signal<number>(0);
+effect(() => {
+  doubled.set(count.get() * 2);
+});
+`;
+  const analyzed = checkSource(source, "t.jsv");
+  assert.equal(analyzed.diagnostics.length, 0);
+  const issue = domAnalyze(source, "t.jsv").issues.find(
+    (item: { code: string; start?: SourcePosition }) =>
+      item.code === "jsv.dom.effect_should_be_computed",
+  );
+  assert.ok(issue?.start);
+  const result = suggestFix(
+    source,
+    "t.jsv",
+    "jsv.dom.effect_should_be_computed",
+    issue.start.line,
+    issue.start.column,
+  );
+  assert.equal(result.applicable, true);
+  const fixed = applyEdits(source, result.edits);
+  assert.match(fixed, /computed<number>\(\(\) => \{ return count\.get\(\) \* 2; \}\)/);
+  assert.equal(fixed.includes("doubled.set"), false);
+  assert.equal(checkSource(fixed, "t.jsv").diagnostics.length, 0);
+
+  const otherWrite = `import { signal, effect } from "jsv/dom";
+let count = signal<number>(0);
+let doubled = signal<number>(0);
+effect(() => {
+  doubled.set(count.get() * 2);
+});
+doubled.set(1);
+`;
+  const other = domAnalyze(otherWrite, "t.jsv").issues.find(
+    (item: { code: string; start?: SourcePosition }) =>
+      item.code === "jsv.dom.effect_should_be_computed",
+  );
+  assert.ok(other?.start);
+  assert.equal(
+    suggestFix(
+      otherWrite,
+      "t.jsv",
+      "jsv.dom.effect_should_be_computed",
+      other.start.line,
+      other.start.column,
+    ).applicable,
+    false,
+  );
+
+  const untyped = `import { signal, effect } from "jsv/dom";
+let count = signal(0);
+let doubled = signal(0);
+effect(() => {
+  doubled.set(count.get() * 2);
+});
+`;
+  const untypedIssue = domAnalyze(untyped, "t.jsv").issues.find(
+    (item) => item.code === "jsv.dom.effect_should_be_computed",
+  );
+  assert.ok(untypedIssue?.start);
+  assert.equal(
+    suggestFix(
+      untyped,
+      "t.jsv",
+      "jsv.dom.effect_should_be_computed",
+      untypedIssue.start.line,
+      untypedIssue.start.column,
+    ).applicable,
+    false,
+  );
+});
+
+test("suggestFix leaves other DOM warnings unedited", () => {
+  const source = `import { signal } from "jsv/dom";
+function f(): void {
+  if (true) {
+    signal<number>(1);
+  }
+}
+`;
+  const issue = domAnalyze(source, "t.jsv").issues.find(
+    (item) => item.code === "jsv.dom.conditional_signal",
+  );
+  assert.ok(issue?.start);
+  const result = suggestFix(
+    source,
+    "t.jsv",
+    "jsv.dom.conditional_signal",
+    issue.start.line,
+    issue.start.column,
+  );
+  assert.equal(result.applicable, false);
+  assert.equal(result.edits.length, 0);
 });

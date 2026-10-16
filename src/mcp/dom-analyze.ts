@@ -29,6 +29,7 @@ export function domAnalyze(
 
   walkProgram(program, {
     inConditional: false,
+    inEffect: false,
     locals,
     signals,
     effects,
@@ -49,6 +50,8 @@ type DomLocals = {
 
 type WalkState = {
   inConditional: boolean;
+  /** True only while walking an effect callback body (not nested functions). */
+  inEffect: boolean;
   locals: DomLocals;
   signals: Span[];
   effects: Span[];
@@ -99,7 +102,7 @@ function walkStatement(stmt: Statement, state: WalkState): void {
     case "class":
       for (const m of stmt.members) {
         if (m.kind === "constructor" || m.kind === "method") {
-          walkBlock(m.body, state);
+          walkBlock(m.body, { ...state, inConditional: false, inEffect: false });
         }
       }
       return;
@@ -147,8 +150,8 @@ function walkStatement(stmt: Statement, state: WalkState): void {
 }
 
 function walkFunctionBody(fn: FunctionDecl, state: WalkState): void {
-  // Function body itself is not a conditional context.
-  walkBlock(fn.body, { ...state, inConditional: false });
+  // Nested functions run later, so they are not conditional or effect context.
+  walkBlock(fn.body, { ...state, inConditional: false, inEffect: false });
 }
 
 function walkBlock(block: Block, state: WalkState): void {
@@ -207,10 +210,13 @@ function walkExpr(expr: Expr, state: WalkState): void {
     case "assert":
       walkExpr(expr.expression, state);
       return;
-    case "arrow":
-      if (expr.body.kind === "block") walkBlock(expr.body, state);
-      else walkExpr(expr.body, state);
+    case "arrow": {
+      // A nested function runs later. Effect callbacks are walked separately.
+      const nested = { ...state, inConditional: false, inEffect: false };
+      if (expr.body.kind === "block") walkBlock(expr.body, nested);
+      else walkExpr(expr.body, nested);
       return;
+    }
     case "call":
       walkCall(expr, state);
       return;
@@ -228,6 +234,8 @@ function walkCall(
   const calleeName =
     expr.callee.kind === "ident" ? expr.callee.name : null;
 
+  let walkArg: ((arg: Expr, index: number) => void) | null = null;
+
   if (calleeName !== null) {
     if (
       state.locals.signal.has(calleeName) ||
@@ -235,26 +243,74 @@ function walkCall(
     ) {
       state.signals.push(expr.span);
       if (state.inConditional) {
-        state.issues.push({
-          code: "jsv.dom.conditional_signal",
-          severity: "warning",
-          message: `Call to '${calleeName}()' is nested inside a conditional.`,
-          file: state.file,
-          start: expr.span.start,
-          end: expr.span.end,
-        });
+        state.issues.push(
+          domIssue(
+            state,
+            "jsv.dom.conditional_signal",
+            `Call to '${calleeName}()' is nested inside a conditional.`,
+            expr.span,
+          ),
+        );
+      }
+      if (state.inEffect) {
+        state.issues.push(
+          domIssue(
+            state,
+            "jsv.dom.signal_in_effect",
+            `Call to '${calleeName}()' is inside an effect. Create it outside the effect.`,
+            expr.span,
+          ),
+        );
+      }
+      if (state.locals.computed.has(calleeName)) {
+        checkComputedWrites(expr, state);
       }
     } else if (state.locals.effect.has(calleeName)) {
       state.effects.push(expr.span);
       checkEffectSelfWrite(expr, state);
+      checkEffectShouldBeComputed(expr, state);
+      walkArg = (arg, index) => {
+        if (index === 0) walkEffectCallback(arg, state);
+        else walkExpr(arg, state);
+      };
     } else if (state.locals.list.has(calleeName)) {
       state.lists.push(expr.span);
       checkListUnusedItem(expr, state);
+      checkListKey(expr, state);
     }
   }
 
   walkExpr(expr.callee, state);
-  for (const a of expr.args) walkExpr(a, state);
+  expr.args.forEach((arg, index) => {
+    if (walkArg !== null) walkArg(arg, index);
+    else walkExpr(arg, state);
+  });
+}
+
+function domIssue(
+  state: WalkState,
+  code: string,
+  message: string,
+  span: Span,
+): Diagnostic {
+  return {
+    code,
+    severity: "warning",
+    message,
+    file: state.file,
+    start: span.start,
+    end: span.end,
+  };
+}
+
+function walkEffectCallback(expr: Expr, state: WalkState): void {
+  const inner = { ...state, inEffect: true };
+  if (expr.kind === "arrow") {
+    if (expr.body.kind === "block") walkBlock(expr.body, inner);
+    else walkExpr(expr.body, inner);
+    return;
+  }
+  walkExpr(expr, inner);
 }
 
 function checkEffectSelfWrite(
@@ -270,17 +326,101 @@ function checkEffectSelfWrite(
 
   for (const name of reads) {
     if (writes.has(name)) {
-      state.issues.push({
-        code: "jsv.dom.effect_self_write",
-        severity: "warning",
-        message: `Effect both reads and writes '${name}'.`,
-        file: state.file,
-        start: call.span.start,
-        end: call.span.end,
-      });
+      state.issues.push(
+        domIssue(
+          state,
+          "jsv.dom.effect_self_write",
+          `Effect both reads and writes '${name}'.`,
+          call.span,
+        ),
+      );
       return;
     }
   }
+}
+
+function checkEffectShouldBeComputed(
+  call: Extract<Expr, { kind: "call" }>,
+  state: WalkState,
+): void {
+  const derived = effectDerivation(call);
+  if (derived === null) return;
+  state.issues.push(
+    domIssue(
+      state,
+      "jsv.dom.effect_should_be_computed",
+      `Effect only derives '${derived.target}' from other signals. Use computed instead.`,
+      call.span,
+    ),
+  );
+}
+
+function effectDerivation(
+  call: Extract<Expr, { kind: "call" }>,
+): { target: string; value: Expr } | null {
+  const cb = call.args[0];
+  if (cb === undefined || cb.kind !== "arrow") return null;
+  const set = singleSetCall(cb.body);
+  if (set === null) return null;
+  const reads = new Set<string>();
+  const writes = new Set<string>();
+  collectSignalAccesses(cb.body, reads, writes);
+  if (writes.size !== 1 || !writes.has(set.target)) return null;
+  if (reads.has(set.target) || reads.size === 0) return null;
+  if (!callsAreAllowed(cb.body, set.target)) return null;
+  const valueReads = new Set<string>();
+  collectSignalAccesses(set.value, valueReads, new Set());
+  let usesRead = false;
+  for (const name of valueReads) {
+    if (reads.has(name)) usesRead = true;
+  }
+  if (!usesRead) return null;
+  return set;
+}
+
+function singleSetCall(
+  body: Expr | Block,
+): { target: string; value: Expr } | null {
+  let expr: Expr;
+  if (body.kind === "block") {
+    if (body.body.length !== 1) return null;
+    const stmt = body.body[0];
+    if (stmt === undefined || stmt.kind !== "expr_stmt") return null;
+    expr = stmt.expression;
+  } else {
+    expr = body;
+  }
+  if (expr.kind !== "call" || expr.args.length !== 1) return null;
+  const arg = expr.args[0];
+  if (arg === undefined) return null;
+  if (expr.callee.kind !== "member" || expr.callee.property !== "set") {
+    return null;
+  }
+  if (expr.callee.object.kind !== "ident") return null;
+  return { target: expr.callee.object.name, value: arg };
+}
+
+function checkComputedWrites(
+  call: Extract<Expr, { kind: "call" }>,
+  state: WalkState,
+): void {
+  const cb = call.args[0];
+  if (cb === undefined || cb.kind !== "arrow") return;
+  const writes = new Set<string>();
+  collectSignalAccesses(cb.body, new Set(), writes);
+  if (writes.size === 0) return;
+  const names = [...writes]
+    .sort()
+    .map((name) => `'${name}'`)
+    .join(", ");
+  state.issues.push(
+    domIssue(
+      state,
+      "jsv.dom.computed_writes",
+      `Computed writes ${names}. Move the write into an effect.`,
+      call.span,
+    ),
+  );
 }
 
 function collectSignalAccesses(
@@ -433,6 +573,175 @@ function collectSignalAccesses(
       collectSignalAccesses(expr.callee, reads, writes);
       for (const a of expr.args) collectSignalAccesses(a, reads, writes);
       return;
+    }
+    default: {
+      const _exhaustive: never = expr;
+      return _exhaustive;
+    }
+  }
+}
+
+function checkListKey(
+  call: Extract<Expr, { kind: "call" }>,
+  state: WalkState,
+): void {
+  if (call.args.length < 3) {
+    state.issues.push(
+      domIssue(
+        state,
+        "jsv.dom.list_missing_key",
+        `list() expects (items, key, render) but was called with ${call.args.length} argument(s).`,
+        call.span,
+      ),
+    );
+    return;
+  }
+  const key = call.args[1];
+  if (key === undefined) return;
+  if (key.kind === "string") {
+    state.issues.push(
+      domIssue(
+        state,
+        "jsv.dom.list_constant_key",
+        "List key is a constant string, so every row shares one key.",
+        call.span,
+      ),
+    );
+    return;
+  }
+  if (key.kind !== "arrow") return;
+  const first = key.params[0];
+  if (first !== undefined && identReferenced(key.body, first.name)) return;
+  const message =
+    first === undefined
+      ? "List key does not use its item, so every row shares one key."
+      : `List key parameter '${first.name}' is never referenced, so every row shares one key.`;
+  state.issues.push(
+    domIssue(state, "jsv.dom.list_constant_key", message, call.span),
+  );
+}
+
+function callsAreAllowed(
+  node: Expr | Block | Statement,
+  target: string,
+): boolean {
+  if (node.kind === "block") {
+    return node.body.every((stmt) => callsAreAllowed(stmt, target));
+  }
+  if (
+    node.kind === "import" ||
+    node.kind === "empty" ||
+    node.kind === "type_alias" ||
+    node.kind === "interface"
+  ) {
+    return true;
+  }
+  if (node.kind === "var") {
+    return node.init === null || callsAreAllowed(node.init, target);
+  }
+  if (node.kind === "function") return callsAreAllowed(node.body, target);
+  if (node.kind === "class") {
+    return node.members.every(
+      (member) =>
+        (member.kind !== "constructor" && member.kind !== "method") ||
+        callsAreAllowed(member.body, target),
+    );
+  }
+  if (node.kind === "if") {
+    return (
+      callsAreAllowed(node.test, target) &&
+      callsAreAllowed(node.consequent, target) &&
+      (node.alternate === null || callsAreAllowed(node.alternate, target))
+    );
+  }
+  if (node.kind === "while") {
+    return (
+      callsAreAllowed(node.test, target) && callsAreAllowed(node.body, target)
+    );
+  }
+  if (node.kind === "for") {
+    const initOk =
+      node.init === null ||
+      (node.init.kind === "var"
+        ? node.init.init === null || callsAreAllowed(node.init.init, target)
+        : callsAreAllowed(node.init, target));
+    return (
+      initOk &&
+      (node.test === null || callsAreAllowed(node.test, target)) &&
+      (node.update === null || callsAreAllowed(node.update, target)) &&
+      callsAreAllowed(node.body, target)
+    );
+  }
+  if (node.kind === "return") {
+    return node.argument === null || callsAreAllowed(node.argument, target);
+  }
+  if (node.kind === "expr_stmt") return callsAreAllowed(node.expression, target);
+
+  const expr = node as Expr;
+  switch (expr.kind) {
+    case "number":
+    case "string":
+    case "boolean":
+    case "null":
+    case "undefined":
+    case "ident":
+      return true;
+    case "template":
+      return expr.parts.every(
+        (part) => part.kind !== "expr" || callsAreAllowed(part.expr, target),
+      );
+    case "array":
+      return expr.elements.every((el) => callsAreAllowed(el, target));
+    case "object":
+      return expr.properties.every((prop) => callsAreAllowed(prop.value, target));
+    case "unary":
+      return callsAreAllowed(expr.argument, target);
+    case "binary":
+      return (
+        callsAreAllowed(expr.left, target) && callsAreAllowed(expr.right, target)
+      );
+    case "assign":
+      return (
+        callsAreAllowed(expr.target, target) &&
+        callsAreAllowed(expr.value, target)
+      );
+    case "ternary":
+      return (
+        callsAreAllowed(expr.test, target) &&
+        callsAreAllowed(expr.consequent, target) &&
+        callsAreAllowed(expr.alternate, target)
+      );
+    case "member":
+      return callsAreAllowed(expr.object, target);
+    case "index":
+      return (
+        callsAreAllowed(expr.object, target) &&
+        callsAreAllowed(expr.index, target)
+      );
+    case "new":
+      return (
+        callsAreAllowed(expr.callee, target) &&
+        expr.args.every((arg) => callsAreAllowed(arg, target))
+      );
+    case "assert":
+      return callsAreAllowed(expr.expression, target);
+    case "arrow":
+      return callsAreAllowed(expr.body, target);
+    case "call": {
+      const get =
+        expr.callee.kind === "member" &&
+        expr.callee.property === "get" &&
+        expr.args.length === 0;
+      const set =
+        expr.callee.kind === "member" &&
+        expr.callee.object.kind === "ident" &&
+        expr.callee.object.name === target &&
+        expr.callee.property === "set";
+      if (!get && !set) return false;
+      return (
+        callsAreAllowed(expr.callee, target) &&
+        expr.args.every((arg) => callsAreAllowed(arg, target))
+      );
     }
     default: {
       const _exhaustive: never = expr;

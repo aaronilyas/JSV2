@@ -98,11 +98,23 @@ Fixes are conservative. `applicable` is false when the code is not fixable, the 
 
 | Diagnostic | Edit |
 |------------|------|
-| `jsv.parse.unexpected_token` whose message includes `expected ';'` | Insert `;` at the diagnostic start |
+| `jsv.parse.unexpected_token` whose message includes `` expected `;` `` | Insert `;` at the diagnostic start when that token starts a line, is `}`, or is a statement keyword (`let`, `const`, `function`, `return`, `if`, `while`, `for`, `type`, `interface`, `class`, `import`, `export`, `else`). A token in the middle of a declaration is left alone |
+| `jsv.parse.unexpected_token` with message `function return type is required` or `method return type is required` | Insert `: T ` before `{` when every valued `return` has the same simple type, or `: void ` when the body is empty or is only a bare `return;`. No edit when returns disagree, the body has statements and no `return`, or another parse error is inside the function or method |
 | `jsv.check.missing_type_arguments` | Insert `<...>` after the callee or type name when every type parameter is inferred from the arguments or the initializer. No edit when a parameter is unconstrained, arguments disagree, or the shapes do not match |
-| `jsv.check.unresolved_name` | Replace the identifier with the single in-scope binding at Damerau–Levenshtein distance 1 (value uses consider value bindings; type uses consider type bindings and primitive type names), **or** insert/extend an `import { … } from "jsv/dom"` when the name is exactly a `jsv/dom` export of the matching kind |
+| `jsv.check.unexpected_type_arguments` | Delete the `<...>` on that call or `new` |
+| `jsv.check.unresolved_name` | One of: replace the identifier with the single in-scope binding at Damerau–Levenshtein distance 1 (value uses consider value bindings; type uses consider type bindings and primitive type names); insert or extend `import { … } from "jsv/dom"` when the name is exactly a `jsv/dom` export of the matching kind; or rename to the single `jsv/dom` export of that kind at distance 1 and import it when it is not already imported under that local. A DOM typo is considered only when both the written name and the export are at least 3 characters. An exact export plus any close in-scope or DOM name, two or more in-scope names at distance 1, or an existing import of that export under a different local produces no edit |
+| `jsv.check.not_assignable`, `jsv.check.condition_not_boolean` | Append `.get()` when the expression is a `Signal` or `Computed` whose inner type is assignable to the expected type. Append `()` when the expression is an uncalled `.get`, or (except on the initializer of an annotated binding) another 0-argument function whose return type fits. Replace `unknown` with `expr as T` when `T` is not `unknown`. Convert a literal only when it is not the initializer of an annotated binding and the expected type has exactly one primitive (`Signal` and `Computed` members are skipped): a number becomes a quoted string of its source text, a boolean becomes `"true"` or `"false"` when that primitive is `string`, and a canonical numeric string becomes a number when that primitive is `number` |
+| `jsv.check.bad_operator` | Wrap the unique operand or pair of operands with `.get()` or `()` that makes the operator legal. Two different minimum wraps produce no edit |
+| `jsv.check.assign_const` | Replace `name = value` with `name.set(value)` when `name` is a writable `Signal` and `value` fits the inner type but not the signal. Otherwise, when `value` already fits and the file has exactly one `const` of that name textually before the assignment, change that `const` to `let` |
+| `jsv.check.missing_property` | Replace the property with the single name in `Known properties:` at distance 1 |
+| `jsv.check.missing_return` | Insert `return ` before the expression when the function or arrow body is a block with exactly one expression statement |
+| `jsv.dom.effect_should_be_computed` | Replace the unique `signal<T>(...)` initializer of the written name with `computed<T>(() => { return expr; })` (importing `computed` when needed) and delete the effect statement. Applied only when the callback is exactly `target.set(expr)`, `expr` is built from `.get()` reads and does not mention `target`, the file has exactly one `.set` or `.update` of `target`, the signal declaration has explicit type arguments, and a recheck adds no diagnostic messages |
 
-A missing `const` initializer (`jsv.parse.const_missing_init`), `jsv.check.not_assignable`, and any unresolved name that is both a close in-scope typo and a `jsv/dom` export are not auto-fixable.
+Mismatch, property, return, type-argument, const, and effect rewrites are kept only when a recheck does not add diagnostic messages and the count of that code drops. Semicolon, return-type, and import or rename edits are not gated that way.
+
+`diagnostics` on a `jsv.dom.*` result are the checker diagnostics, not the DOM warnings. Read warnings from `domAnalyze`.
+
+These stay `applicable: false`: `jsv.parse.const_missing_init`; a literal that initializes an annotated binding (`let x: string = 1`); a `Signal<number>` (or other inner type) that does not fit the expected type; assigning a value that does not fit a `const`'s type; assigning to a `Computed`; more than one `const` of the written name; and every DOM warning other than `jsv.dom.effect_should_be_computed`.
 
 ### `domAnalyze`
 
@@ -118,6 +130,11 @@ Issue codes (severity `warning`):
 
 | Code | When |
 |------|------|
-| `jsv.dom.conditional_signal` | `signal()` / `computed()` nested in `if` / `while` / `for` |
+| `jsv.dom.conditional_signal` | `signal()` / `computed()` directly nested in `if` / `while` / `for`. A nested function, method, or arrow clears the conditional, so a signal created inside that nested function is not flagged |
+| `jsv.dom.signal_in_effect` | `signal()` / `computed()` directly inside an `effect` callback. Nested functions and arrows are not inside the effect for this check. An `if` inside the effect can also report `jsv.dom.conditional_signal` |
 | `jsv.dom.effect_self_write` | Same identifier is both `.get()`-read and `.set()`/`.update()`-written inside one `effect` callback |
+| `jsv.dom.effect_should_be_computed` | The effect callback is exactly `target.set(expr)`, `target` is not also read, `expr` reads at least one other signal with `.get()`, and every call in the body is a 0-argument `.get()` or that `target.set(...)`. `console.log` or any other call suppresses the warning |
+| `jsv.dom.computed_writes` | A `computed` callback contains `.set` or `.update` |
+| `jsv.dom.list_missing_key` | `list()` is called with fewer than three arguments |
+| `jsv.dom.list_constant_key` | The key argument is a string literal, an arrow with no first parameter, or an arrow whose first parameter is never referenced. A non-arrow name is not flagged |
 | `jsv.dom.list_unused_item` | `list` render callback’s first parameter is never referenced in the body |

@@ -53,6 +53,24 @@ export type TypeArgHint = {
   args: string[];
 };
 
+/**
+ * Structured types for one diagnostic, filled only when `suggestFix` asks.
+ * `source` / `target` are the mismatch pair. Operator hints also set `op`
+ * and the operand types.
+ */
+export type MismatchHint = {
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  code: string;
+  source: Type;
+  target: Type;
+  op?: string;
+  left?: Type;
+  right?: Type;
+};
+
 export type BindingOrigin =
   | "local"
   | "param"
@@ -85,6 +103,8 @@ export type CheckOptions = {
   typecheckPartial?: boolean;
   /** Filled with unambiguous call/annotation type-argument inferences. */
   typeArgHints?: TypeArgHint[];
+  /** Filled with types at mismatch diagnostics (for conservative fixes). */
+  mismatchHints?: MismatchHint[];
   /** Filled with the scope (and member receiver) at line/column. */
   completion?: CompletionCapture;
   typeQuery?: {
@@ -133,6 +153,7 @@ type CheckerContext = {
   thisType: Type | null;
   inExprStmt: boolean;
   typeArgHints?: TypeArgHint[];
+  mismatchHints?: MismatchHint[];
   completion?: CompletionCapture;
   typeQuery?: {
     line: number;
@@ -168,6 +189,21 @@ function diag(
   }
   if (hint !== undefined) d.hint = hint;
   ctx.diagnostics.push(d);
+}
+
+function recordMismatch(
+  ctx: CheckerContext,
+  span: Span,
+  hint: Omit<MismatchHint, "line" | "column" | "endLine" | "endColumn">,
+): void {
+  if (ctx.mismatchHints === undefined) return;
+  ctx.mismatchHints.push({
+    line: span.start.line,
+    column: span.start.column,
+    endLine: span.end.line,
+    endColumn: span.end.column,
+    ...hint,
+  });
 }
 
 function pushScope(ctx: CheckerContext): void {
@@ -516,6 +552,7 @@ function checkModule(
   extras?: {
     typecheckPartial?: boolean;
     typeArgHints?: TypeArgHint[];
+    mismatchHints?: MismatchHint[];
     completion?: CompletionCapture;
   },
 ): ModuleResult {
@@ -539,6 +576,7 @@ function checkModule(
     moduleCache,
     checkingStack,
     typeArgHints: extras?.typeArgHints,
+    mismatchHints: extras?.mismatchHints,
     completion: extras?.completion,
     scope: {
       bindings: new Map(),
@@ -1339,6 +1377,11 @@ function checkCondition(ctx: CheckerContext, expr: Expr): void {
       `Condition must be 'boolean', but got '${typeToString(t)}'.`,
       expr.span,
     );
+    recordMismatch(ctx, expr.span, {
+      code: "jsv.check.condition_not_boolean",
+      source: t,
+      target: prim("boolean"),
+    });
   }
 }
 
@@ -1356,6 +1399,11 @@ function checkAssignability(
       `Type '${typeToString(source)}' is not assignable to type '${typeToString(target)}'.`,
       span,
     );
+    recordMismatch(ctx, span, {
+      code: "jsv.check.not_assignable",
+      source,
+      target,
+    });
   }
 }
 
@@ -1729,6 +1777,11 @@ function checkUnary(
         `Operand of '!' must be 'boolean', but got '${typeToString(t)}'.`,
         expr.argument.span,
       );
+      recordMismatch(ctx, expr.argument.span, {
+        code: "jsv.check.condition_not_boolean",
+        source: t,
+        target: prim("boolean"),
+      });
     }
     return prim("boolean");
   }
@@ -1741,6 +1794,13 @@ function checkUnary(
       `Operator '-' cannot be applied to type '${typeToString(t)}'.`,
       expr.span,
     );
+    recordMismatch(ctx, expr.span, {
+      code: "jsv.check.bad_operator",
+      source: t,
+      target: prim("number"),
+      op: "-",
+      left: t,
+    });
     return ERROR_TYPE;
   }
   return prim("number");
@@ -1787,6 +1847,14 @@ function checkBinary(
         `Operator '${op}' cannot be applied to types '${typeToString(lt)}' and '${typeToString(rt)}'.`,
         expr.span,
       );
+      recordMismatch(ctx, expr.span, {
+        code: "jsv.check.bad_operator",
+        source: lt,
+        target: rt,
+        op,
+        left: lt,
+        right: rt,
+      });
     }
     return prim("boolean");
   }
@@ -1817,6 +1885,14 @@ function checkBinary(
       `Operator '+' cannot be applied to types '${typeToString(lt)}' and '${typeToString(rt)}'.`,
       expr.span,
     );
+    recordMismatch(ctx, expr.span, {
+      code: "jsv.check.bad_operator",
+      source: lt,
+      target: rt,
+      op: "+",
+      left: lt,
+      right: rt,
+    });
     return ERROR_TYPE;
   }
 
@@ -1834,6 +1910,14 @@ function checkBinary(
       `Operator '${op}' cannot be applied to types '${typeToString(lt)}' and '${typeToString(rt)}'.`,
       expr.span,
     );
+    recordMismatch(ctx, expr.span, {
+      code: "jsv.check.bad_operator",
+      source: lt,
+      target: rt,
+      op,
+      left: lt,
+      right: rt,
+    });
     return ERROR_TYPE;
   }
   return prim("number");
@@ -1884,6 +1968,13 @@ function checkAssign(
     const valueType = checkExpr(ctx, expr.value, b.valueType);
     rejectVoidValue(ctx, valueType, expr.value.span);
     checkAssignability(ctx, valueType, b.valueType, expr.value.span);
+    if (!b.mutable) {
+      recordMismatch(ctx, target.span, {
+        code: "jsv.check.assign_const",
+        source: valueType,
+        target: b.valueType,
+      });
+    }
     return b.valueType;
   }
 
@@ -1927,16 +2018,8 @@ function checkAssign(
       checkExpr(ctx, expr.value, null);
       return ERROR_TYPE;
     }
-    if (
-      indexType.kind !== "error" &&
-      !isAssignable(indexType, prim("number"))
-    ) {
-      diag(
-        ctx,
-        "jsv.check.not_assignable",
-        `Type '${typeToString(indexType)}' is not assignable to type 'number'.`,
-        target.index.span,
-      );
+    if (indexType.kind !== "error") {
+      checkAssignability(ctx, indexType, prim("number"), target.index.span);
     }
     const valueType = checkExpr(ctx, expr.value, expanded.element);
     rejectVoidValue(ctx, valueType, expr.value.span);
@@ -2354,16 +2437,8 @@ function checkIndex(
     }
     return ERROR_TYPE;
   }
-  if (
-    indexType.kind !== "error" &&
-    !isAssignable(indexType, prim("number"))
-  ) {
-    diag(
-      ctx,
-      "jsv.check.not_assignable",
-      `Type '${typeToString(indexType)}' is not assignable to type 'number'.`,
-      expr.index.span,
-    );
+  if (indexType.kind !== "error") {
+    checkAssignability(ctx, indexType, prim("number"), expr.index.span);
   }
   return expanded.element;
 }
@@ -2562,6 +2637,7 @@ export function checkSource(
     {
       typecheckPartial: options?.typecheckPartial === true,
       typeArgHints: options?.typeArgHints,
+      mismatchHints: options?.mismatchHints,
       completion: options?.completion,
     },
   );
